@@ -36,14 +36,9 @@ if not OPENAI_API_KEY:
 if not MCP_URL:
     raise RuntimeError("MCP_URL is not configured")
 if not 1 <= MAX_TOOL_ROUNDS <= 10:
-    raise RuntimeError("MAX_TOOL_ROUNDS_SECONDS must be between 1 and 10")
+    raise RuntimeError("MAX_TOOL_ROUNDS must be between 1 and 10")
 
-client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    timeout=OPENAI_TIMEOUT,
-    max_retries=2,
-)
-
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT, max_retries=2)
 app = FastAPI(title="Home Assistant AI")
 
 
@@ -129,12 +124,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "service": "home-assistant-agent",
-        "model": OPENAI_MODEL,
-        "mcp_configured": bool(MCP_URL),
-    }
+    return {"status": "ok", "service": "home-assistant-agent", "model": OPENAI_MODEL, "mcp_configured": bool(MCP_URL)}
 
 
 async def run_with_timeout(awaitable, timeout: float, operation: str):
@@ -153,14 +143,12 @@ async def load_mcp_tools(session: ClientSession):
 @app.post("/chat")
 async def chat(request: ChatRequest):
     logger.info("Processing chat request")
-
     try:
         async with streamable_http_client(MCP_URL) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 tools = await load_mcp_tools(session)
                 openai_tools = []
                 tool_names = set()
-
                 for tool in tools:
                     tool_names.add(tool.name)
                     openai_tools.append({
@@ -171,7 +159,6 @@ async def chat(request: ChatRequest):
                             "parameters": tool.input_schema,
                         },
                     })
-
                 if not openai_tools:
                     raise RuntimeError("MCP server returned no tools")
 
@@ -179,19 +166,20 @@ async def chat(request: ChatRequest):
                     {
                         "role": "system",
                         "content": (
-                            "You are a Home Assistant AI assistant. "
-                            "Use the available Home Assistant tools to answer questions about the smart home. "
-                            "For an unknown device or sensor, search for an entity first. "
-                            "Use get_entity_state when the current state is required. "
-                            "If search returns no matching entity, say that the entity was not found. "
-                            "Never invent entity IDs, sensor values, device states or measurements. "
-                            "When several entities match, use the most relevant match and state which entity you used. "
-                            "When the user asks for the status or condition of a device, inspect the search results for "
-                            "other entities belonging to the same device. Include relevant related status values, "
-                            "such as consumables, temperatures, counters or operating states, when they are present. "
-                            "For example, when a printer search returns its printer status and cartridge entities, "
-                            "report the printer status together with the cartridge levels instead of reporting only the main entity. "
-                            "Do not invent relationships; only group entities when the tool results identify the same device."
+                            "You are a Home Assistant AI assistant. Use the available Home Assistant tools to answer questions. "
+                            "For unknown devices or sensors, search_entities first. Never invent entity IDs, values or states. "
+                            "Use get_entity_state when current state is required. "
+                            "Use call_service only for actions allowed by the MCP server. "
+                            "Configuration editing is a separate privileged capability. If the user asks to read or change YAML, "
+                            "first call configuration_status. If configuration editing is disabled, explain that it must be enabled. "
+                            "If enabled and the user explicitly asks to change an allowed YAML file, read the current file first, "
+                            "make the smallest necessary change, preserve all unrelated content, and then call update_config with the complete new file. "
+                            "Do not claim a configuration change was made unless update_config returns success. "
+                            "Never replace a configuration file with a guessed or unrelated example. "
+                            "For a requested configuration change, explain what will be changed before performing it when the change is consequential. "
+                            "For a harmless test such as adding a comment, it is acceptable to execute directly when explicitly requested. "
+                            "When several entities match, use the most relevant match and state which entity was used. "
+                            "When a device has related entities, report relevant related states only when the tool results identify the same device."
                         ),
                     },
                     {"role": "user", "content": request.message},
@@ -208,50 +196,34 @@ async def chat(request: ChatRequest):
                         OPENAI_TIMEOUT,
                         "OpenAI request",
                     )
-
                     message = response.choices[0].message
                     if not message.tool_calls:
                         return {"response": message.content or ""}
-
                     messages.append(message.model_dump(exclude_none=True))
 
                     for tool_call in message.tool_calls:
                         tool_name = tool_call.function.name
                         if tool_name not in tool_names:
                             raise RuntimeError(f"Model requested unknown MCP tool: {tool_name}")
-
                         try:
                             arguments = json.loads(tool_call.function.arguments or "{}")
                         except json.JSONDecodeError as exc:
                             raise RuntimeError(f"Invalid arguments for MCP tool {tool_name}") from exc
-
                         logger.info("Calling MCP tool: %s", tool_name)
-                        result = await run_with_timeout(
-                            session.call_tool(tool_name, arguments),
-                            MCP_TIMEOUT,
-                            f"MCP tool {tool_name}",
-                        )
-
+                        result = await run_with_timeout(session.call_tool(tool_name, arguments), MCP_TIMEOUT, f"MCP tool {tool_name}")
                         tool_text = ""
                         for content in result.content:
                             if hasattr(content, "text") and content.text:
                                 tool_text += content.text
-
                         if getattr(result, "is_error", False):
                             tool_text = f"MCP tool error: {tool_text or 'unknown error'}"
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_text or "No data returned.",
-                        })
-
+                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_text or "No data returned."})
                 raise RuntimeError("Maximum tool-call rounds exceeded")
 
     except OpenAIError as exc:
         logger.exception("OpenAI request failed")
         return {"error": f"OpenAI error: {exc}"}
-    except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
+    except (TimeoutError, OSError, RuntimeError, ValueError, PermissionError) as exc:
         logger.exception("Agent request failed")
         return {"error": str(exc)}
     except Exception as exc:

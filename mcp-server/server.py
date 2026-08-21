@@ -211,18 +211,18 @@ async def list_tools(context, params) -> ListToolsResult:
                 name="search_entities",
                 description=(
                     "Search Home Assistant entities by entity ID, friendly name, device name, "
-                    "manufacturer, model, device class, domain or current state. Use this before "
-                    "get_entity_state when the exact entity ID is unknown."
+                    "manufacturer, model, device class, domain or current state. "
+                    "Use this before get_entity_state when the exact entity ID is unknown. "
+                    "If query is empty, return the available entities."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search terms such as 'vorlauf', 'temperature', 'drucker', 'HP' or 'carel'.",
+                            "description": "Optional search terms such as 'vorlauf', 'temperature', 'drucker', 'HP' or 'carel'. Leave empty to list available entities.",
                         }
                     },
-                    "required": ["query"],
                 },
             ),
             Tool(
@@ -246,23 +246,26 @@ async def list_tools(context, params) -> ListToolsResult:
 async def call_tool(context, params) -> CallToolResult:
     if params.name == "search_entities":
         query = str(params.arguments.get("query", "")).strip()
-        if not query:
-            raise ValueError("query is required")
 
         indexed_entities = await build_entity_index()
         results = []
 
-        for entity in indexed_entities:
-            registry_text_value = entity.pop("registry_text", "")
-            score = search_score(query, entity, registry_text_value)
-            if score > 0:
-                entity["_score"] = score
-                results.append(entity)
+        if not query:
+            results = indexed_entities
+        else:
+            for entity in indexed_entities:
+                registry_text_value = entity.pop("registry_text", "")
+                score = search_score(query, entity, registry_text_value)
+                if score > 0:
+                    entity["_score"] = score
+                    results.append(entity)
 
-        results.sort(key=lambda item: (-item.pop("_score"), item["entity_id"]))
+            results.sort(key=lambda item: (-item.pop("_score"), item["entity_id"]))
+
         logger.info("Entity search '%s' returned %d results", query, len(results))
 
         for result in results:
+            result.pop("registry_text", None)
             if not result.get("device_name"):
                 result.pop("device_name", None)
             if not result.get("manufacturer"):

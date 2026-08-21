@@ -1,14 +1,16 @@
 import asyncio
 import json
+import logging
 import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 
 from openai import AsyncOpenAI
+from openai import OpenAIError
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -16,25 +18,37 @@ from mcp.client.streamable_http import streamable_http_client
 
 load_dotenv()
 
-MCP_URL = os.environ.get(
-    "MCP_URL",
-    "http://localhost:8000/mcp",
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("home-assistant-agent")
+
+MCP_URL = os.environ.get("MCP_URL", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+MCP_TIMEOUT = float(os.environ.get("MCP_TIMEOUT_SECONDS", "15"))
+OPENAI_TIMEOUT = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "5"))
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not configured")
+if not MCP_URL:
+    raise RuntimeError("MCP_URL is not configured")
+if not 1 <= MAX_TOOL_ROUNDS <= 10:
+    raise RuntimeError("MAX_TOOL_ROUNDS_SECONDS must be between 1 and 10")
+
+client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=OPENAI_TIMEOUT,
+    max_retries=2,
 )
 
-OPENAI_MODEL = os.environ.get(
-    "OPENAI_MODEL",
-    "gpt-5",
-)
-
-client = AsyncOpenAI()
-
-app = FastAPI(
-    title="Home Assistant AI",
-)
+app = FastAPI(title="Home Assistant AI")
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
 
 
 HTML = """
@@ -89,7 +103,7 @@ async function sendMessage() {
         const response = await fetch("/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: message }) });
         const data = await response.json();
         chat.lastChild.remove();
-        if (data.error) addMessage("Fehler: " + data.error, "assistant");
+        if (!response.ok || data.error) addMessage("Fehler: " + (data.error || "Unbekannter Fehler"), "assistant");
         else addMessage(data.response, "assistant");
     } catch (error) {
         chat.lastChild.remove();
@@ -113,65 +127,130 @@ async def index():
     return HTML
 
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "home-assistant-agent",
+        "model": OPENAI_MODEL,
+        "mcp_configured": bool(MCP_URL),
+    }
+
+
+async def run_with_timeout(awaitable, timeout: float, operation: str):
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"{operation} timed out after {timeout:.0f}s") from exc
+
+
+async def load_mcp_tools(session: ClientSession):
+    await run_with_timeout(session.initialize(), MCP_TIMEOUT, "MCP initialization")
+    result = await run_with_timeout(session.list_tools(), MCP_TIMEOUT, "MCP tool discovery")
+    return result.tools
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    logger.info("Processing chat request")
+
     try:
         async with streamable_http_client(MCP_URL) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                tools_result = await session.list_tools()
+                tools = await load_mcp_tools(session)
                 openai_tools = []
-                for tool in tools_result.tools:
+                tool_names = set()
+
+                for tool in tools:
+                    tool_names.add(tool.name)
                     openai_tools.append({
                         "type": "function",
                         "function": {
                             "name": tool.name,
-                            "description": tool.description,
+                            "description": tool.description or "Home Assistant tool",
                             "parameters": tool.input_schema,
                         },
                     })
+
+                if not openai_tools:
+                    raise RuntimeError("MCP server returned no tools")
+
                 messages = [
                     {
                         "role": "system",
                         "content": (
                             "You are a Home Assistant AI assistant. "
-                            "Use the available Home Assistant tools "
-                            "to answer questions about the user's smart home. "
-                            "If you need to find an entity, use search_entities first. "
-                            "Then use get_entity_state to retrieve the current value. "
-                            "Never invent sensor values."
+                            "Use the available Home Assistant tools to answer questions about the smart home. "
+                            "For an unknown device or sensor, search for an entity first. "
+                            "Use get_entity_state when the current state is required. "
+                            "If search returns no matching entity, say that the entity was not found. "
+                            "Never invent entity IDs, sensor values, device states or measurements. "
+                            "When several entities match, use the most relevant match and state which entity you used."
                         ),
                     },
                     {"role": "user", "content": request.message},
                 ]
-                while True:
-                    response = await client.chat.completions.create(
-                        model=OPENAI_MODEL,
-                        messages=messages,
-                        tools=openai_tools,
-                        tool_choice="auto",
+
+                for _ in range(MAX_TOOL_ROUNDS):
+                    response = await run_with_timeout(
+                        client.chat.completions.create(
+                            model=OPENAI_MODEL,
+                            messages=messages,
+                            tools=openai_tools,
+                            tool_choice="auto",
+                        ),
+                        OPENAI_TIMEOUT,
+                        "OpenAI request",
                     )
+
                     message = response.choices[0].message
                     if not message.tool_calls:
                         return {"response": message.content or ""}
+
                     messages.append(message.model_dump(exclude_none=True))
+
                     for tool_call in message.tool_calls:
                         tool_name = tool_call.function.name
-                        arguments = json.loads(tool_call.function.arguments)
-                        result = await session.call_tool(tool_name, arguments)
+                        if tool_name not in tool_names:
+                            raise RuntimeError(f"Model requested unknown MCP tool: {tool_name}")
+
+                        try:
+                            arguments = json.loads(tool_call.function.arguments or "{}")
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError(f"Invalid arguments for MCP tool {tool_name}") from exc
+
+                        logger.info("Calling MCP tool: %s", tool_name)
+                        result = await run_with_timeout(
+                            session.call_tool(tool_name, arguments),
+                            MCP_TIMEOUT,
+                            f"MCP tool {tool_name}",
+                        )
+
                         tool_text = ""
                         for content in result.content:
-                            if hasattr(content, "text"):
+                            if hasattr(content, "text") and content.text:
                                 tool_text += content.text
+
+                        if getattr(result, "is_error", False):
+                            tool_text = f"MCP tool error: {tool_text or 'unknown error'}"
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": tool_text,
+                            "content": tool_text or "No data returned.",
                         })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": f"{type(e).__name__}: {e}"}
+
+                raise RuntimeError("Maximum tool-call rounds exceeded")
+
+    except OpenAIError as exc:
+        logger.exception("OpenAI request failed")
+        return {"error": f"OpenAI error: {exc}"}
+    except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
+        logger.exception("Agent request failed")
+        return {"error": str(exc)}
+    except Exception as exc:
+        logger.exception("Unexpected agent error")
+        return {"error": f"Unexpected error: {type(exc).__name__}"}
 
 
 if __name__ == "__main__":

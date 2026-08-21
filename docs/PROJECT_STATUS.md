@@ -7,30 +7,36 @@
 ## 1. Current architecture
 
 ```text
-Mac (current development agent)
+Client Browser
     |
-    | MCP_URL=http://192.168.1.233:8000/mcp
     v
-QNAP
+QNAP:192.168.1.232:8080
+    |
+    +-- home-assistant-agent :8080
+    |       |
+    |       +-- OpenAI API
+    |       |
+    |       +-- MCP_URL -> http://192.168.1.233:8000/mcp
+    |                         |
+    |                         v
+    |                 home-assistant-mcp :8000
+    |                         |
+    |                         v
+    |                 Home Assistant :8123
+    |                 192.168.1.235
     |
     +-- home-assistant-mcp :8000
-    |       |
-    |       v
-    |   Home Assistant :8123
-    |
-    +-- home-assistant-agent :8080   <-- target runtime
-            |
-            +-- OpenAI API
-            +-- MCP server
 ```
 
-The **MCP server is already running persistently on the QNAP**. The AI agent is currently being developed/tested as a Python process on the Mac. The target architecture is for the agent to run permanently as a Docker container, preferably from a Docker image/Docker Hub deployment, so the Mac is not part of the production runtime.
+The **MCP server and the AI agent are now both running on the QNAP as Docker containers**. The Mac is currently a development workstation only and is no longer required for the runtime path.
 
-## 2. Git status
+Target principle: the production runtime must not depend on the Mac. The QNAP containers should be reproducible from the GitHub repository and later preferably from Docker Hub images.
 
-The repository is public and currently clean on `main`.
+## 2. Repository / Git status
 
-Relevant commits reached `origin/main`:
+The repository is public. No secrets are to be committed.
+
+Relevant history:
 
 ```text
 95712c5 Handle null values in entity search
@@ -43,59 +49,60 @@ aaf674a Improve entity discovery using Home Assistant registries
 fcb4355 Document runtime hardening settings
 ```
 
-The current agent enhancement commit is:
+The agent behavior enhancement was committed as:
 
 ```text
 ce2a13d Improve device status summaries
 ```
 
-After this document is committed, pull the latest `main` on the Mac and QNAP as appropriate.
+The current project-status documentation is the checkpoint for continuing development.
 
-## 3. MCP server — QNAP
+## 3. QNAP network
 
-### Container
-
-Container name:
-
-```text
-home-assistant-mcp
-```
-
-Image:
-
-```text
-home-assistant-mcp:latest
-```
-
-Network:
+Both containers use the QNAP Docker network:
 
 ```text
 qnet-dhcp-bond0-6d6da6
 ```
 
-The container uses **DHCP for its IP address** and a **fixed MAC address** so that the DHCP lease remains stable.
+The containers use **DHCP for their IP addresses** and **fixed MAC addresses**. This follows the deployment pattern used in the KACO project and keeps the DHCP-assigned IP stable.
 
-Current deployment values used during testing:
-
-```text
-MAC: 02:42:81:c4:95:29
-IP: 192.168.1.233
-MCP: http://192.168.1.233:8000/mcp
-```
-
-These values are documented here as the current test/deployment state. Secrets must never be stored here or in Git.
-
-Home Assistant endpoint:
+### MCP server
 
 ```text
-http://192.168.1.235:8123
+Container: home-assistant-mcp
+IP:        192.168.1.233
+MAC:       02:42:81:c4:95:29
+Port:      8000
+MCP URL:   http://192.168.1.233:8000/mcp
 ```
 
-The Home Assistant token is passed to the container at runtime through `HA_TOKEN`; it is **not stored in the repository**.
+### AI agent
 
-### Runtime parameters
+```text
+Container: home-assistant-agent
+IP:        192.168.1.232
+MAC:       02:42:81:c4:95:2a
+Port:      8080
+Web UI:    http://192.168.1.232:8080/
+Health:    http://192.168.1.232:8080/health
+```
 
-The working QNAP container was started with the equivalent configuration:
+### Home Assistant
+
+```text
+URL: http://192.168.1.235:8123
+```
+
+## 4. MCP server — QNAP
+
+### Container
+
+```text
+home-assistant-mcp:latest
+```
+
+Runtime configuration:
 
 ```bash
 docker run -d \
@@ -105,79 +112,196 @@ docker run -d \
   --mac-address 02:42:81:c4:95:29 \
   -p 8000:8000 \
   -e HA_URL=http://192.168.1.235:8123 \
-  -e HA_TOKEN='YOUR_TOKEN' \
+  -e HA_TOKEN='YOUR_HOME_ASSISTANT_TOKEN' \
   home-assistant-mcp:latest
 ```
 
-Replace `YOUR_TOKEN` locally with the actual Home Assistant long-lived access token. Do not commit it.
+The real `HA_TOKEN` is supplied only at runtime. It must never be committed to GitHub.
 
-### Deployment without Git on QNAP
+### MCP functionality validated
 
-The QNAP does not have Git available. Deployment from GitHub therefore uses `wget` against `raw.githubusercontent.com`.
-
-Example:
-
-```bash
-cd /share/Container/home-assistant-agent
-wget -O mcp-server/server.py https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/mcp-server/server.py
-wget -O mcp-server/Dockerfile https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/mcp-server/Dockerfile
-wget -O mcp-server/requirements.txt https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/mcp-server/requirements.txt
-```
-
-Then rebuild:
-
-```bash
-docker build --no-cache -t home-assistant-mcp ./mcp-server
-```
-
-For a production deployment, all relevant files in `mcp-server/` and `deploy/qnap/` should be synchronized before rebuilding.
-
-## 4. MCP functionality validated
-
-The MCP endpoint is reachable and returns HTTP 200.
-
-The MCP client successfully discovers these tools:
+The MCP endpoint is reachable and the MCP client successfully discovers:
 
 ```text
 search_entities
 get_entity_state
 ```
 
-The following complete flow has been validated:
+The validated flow is:
 
 ```text
 MCP client
-  -> streamable HTTP /mcp
+  -> Streamable HTTP /mcp
   -> MCP server
-  -> Home Assistant API/WebSocket
-  -> entity registry/state data
+  -> Home Assistant WebSocket / REST
+  -> entity registry + state data
 ```
 
-### Entity discovery
-
-`search_entities` now uses Home Assistant entity/device registries in addition to state data. Search ranking considers normalized:
-
-- friendly name
-- entity ID
-- registry/device information
-- device class
-- domain
-- current state
+`search_entities` uses Home Assistant entity/device registries in addition to state data. Search ranking considers normalized friendly name, entity ID, registry/device information, device class, domain and current state.
 
 Null values are handled safely by `normalize()`.
 
-### Real test result — HP printer
+### Important MCP HTTP test note
 
-The following searches were executed successfully:
+A plain request such as:
 
-```text
-HP
-M477
-printer
-toner
+```bash
+curl http://192.168.1.233:8000/mcp
 ```
 
-`HP` and `M477` returned the printer and four cartridge entities. `printer` and `toner` returned no direct matches, which is acceptable because the device can still be discovered through its manufacturer/model/name.
+or a basic Python `urllib.request.urlopen()` call can return:
+
+```text
+HTTP 406 Not Acceptable
+```
+
+This is **not evidence that MCP is broken**. The Streamable HTTP MCP endpoint expects MCP-specific request/accept headers and protocol handling. The actual MCP client used by the agent has been tested successfully and receives HTTP 200 responses.
+
+## 5. MCP deployment on QNAP without Git
+
+The QNAP does not have Git available. Source deployment therefore uses `wget` from GitHub's raw content endpoint.
+
+From:
+
+```bash
+cd /share/Container/home-assistant-agent
+```
+
+Example MCP update:
+
+```bash
+wget -O mcp-server/server.py https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/mcp-server/server.py
+wget -O mcp-server/Dockerfile https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/mcp-server/Dockerfile
+wget -O mcp-server/requirements.txt https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/mcp-server/requirements.txt
+```
+
+Rebuild:
+
+```bash
+docker build --no-cache -t home-assistant-mcp ./mcp-server
+```
+
+When updating the MCP container, stop/remove the old container and recreate it with the same network, fixed MAC and runtime token parameters. Never put the token into source files.
+
+## 6. AI agent — current QNAP runtime
+
+The agent is now running as a Docker container on the QNAP.
+
+Current image:
+
+```text
+home-assistant-agent:latest
+```
+
+Current runtime configuration:
+
+```bash
+docker run -d \
+  --name home-assistant-agent \
+  --restart unless-stopped \
+  --network qnet-dhcp-bond0-6d6da6 \
+  --mac-address 02:42:81:c4:95:2a \
+  -p 8080:8080 \
+  -e MCP_URL=http://192.168.1.233:8000/mcp \
+  -e OPENAI_MODEL=gpt-5 \
+  -e OPENAI_API_KEY='YOUR_OPENAI_API_KEY' \
+  home-assistant-agent:latest
+```
+
+The real OpenAI API key is passed as a runtime parameter and is not stored in the repository.
+
+### Current runtime health
+
+Validated on 2026-08-21:
+
+```text
+Container: Up / healthy
+Uvicorn:   0.0.0.0:8080
+Health:    HTTP 200
+MCP:       HTTP 200 through the MCP client
+OpenAI:    HTTP 200
+```
+
+The container log showed successful calls to:
+
+```text
+POST http://192.168.1.233:8000/mcp  -> 200 OK
+POST https://api.openai.com/v1/chat/completions -> 200 OK
+```
+
+The browser successfully loaded:
+
+```text
+http://192.168.1.232:8080/
+```
+
+## 7. Agent deployment on QNAP without Git
+
+The QNAP agent source is synchronized with `wget`.
+
+From:
+
+```bash
+cd /share/Container/home-assistant-agent
+```
+
+Current deployment commands:
+
+```bash
+wget -O agent/agent.py https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/agent.py
+wget -O agent/Dockerfile https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/Dockerfile
+wget -O agent/requirements.txt https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/requirements.txt
+```
+
+Build:
+
+```bash
+docker build --no-cache -t home-assistant-agent ./agent
+```
+
+Then recreate the container with the runtime command documented above.
+
+## 8. Agent application
+
+The agent provides:
+
+```text
+GET  /
+GET  /health
+POST /chat
+```
+
+The web UI is a simple browser chat interface.
+
+Current Python base image:
+
+```text
+python:3.12-slim
+```
+
+The container runs the application as the non-root user:
+
+```text
+agent (UID 1000)
+```
+
+The current agent includes:
+
+- OpenAI Chat Completions integration
+- dynamic MCP tool discovery
+- MCP tool calling
+- OpenAI request timeout/retries
+- MCP initialization/tool-call timeouts
+- maximum tool-call rounds
+- JSON argument validation
+- unknown MCP tool validation
+- controlled error handling
+- `/health` endpoint
+- environment-based configuration
+
+## 9. Entity discovery / HP printer test
+
+The MCP layer successfully discovered the HP printer through searches such as `HP` and `M477`.
 
 Validated entities:
 
@@ -189,7 +313,7 @@ sensor.hp_color_laserjet_mfp_m477fdn_magenta_cartridge_hp_cf413x
 sensor.hp_color_laserjet_mfp_m477fdn_yellow_cartridge_hp_cf412x
 ```
 
-Observed test state:
+Observed test values:
 
 ```text
 Printer: idle
@@ -199,127 +323,200 @@ Magenta: 96 %
 Yellow: 96 %
 ```
 
-## 5. Agent — current development state
+The MCP search results identify the cartridge entities as belonging to the same HP printer device.
 
-The agent is currently run on the Mac for development/testing.
+## 10. Current known limitation — natural-language device aliases
 
-Mac Python environment used successfully:
+The infrastructure is working, but the natural-language search is **not yet fully robust**.
 
-```text
-Python 3.12.14
-```
-
-A virtual environment was created under:
+Direct MCP searches showed:
 
 ```text
-.venv/
+HP        -> printer + cartridges found
+M477      -> printer + cartridges found
+printer   -> []
+toner     -> []
+vorlauf   -> []
 ```
 
-Required dependencies installed successfully and import-tested:
-
-```text
-openai
-mcp
-fastapi
-uvicorn
-python-dotenv
-```
-
-The agent connects to the QNAP MCP server using:
-
-```text
-MCP_URL=http://192.168.1.233:8000/mcp
-```
-
-The OpenAI API key is provided locally through environment configuration and is not stored in Git.
-
-## 6. Agent behavior validated
-
-A real natural-language request was tested:
+Therefore a user question such as:
 
 > Was macht der Drucker?
 
-The agent successfully used the MCP server and returned the printer status:
+can still result in the agent saying that no printer was found, even though the actual printer entities are available in Home Assistant.
 
-> Der Drucker ist gerade im Leerlauf (idle).
+The agent did call `search_entities` multiple times during the failed natural-language test, so the MCP connection itself was working. The remaining issue is the **semantic/entity resolution strategy**, not Docker, networking, OpenAI authentication or MCP connectivity.
 
-The current agent code has since been enhanced so that, when a device-status question is asked, the model is instructed to consider related entities belonging to the same device. For the printer use case this is intended to produce a combined response containing printer status and toner levels.
+This is intentionally left as the next development item rather than being changed blindly in the current milestone.
 
-The enhancement is committed as:
+Potential future improvement:
+
+- better German/English device alias handling
+- query expansion/synonyms
+- multi-query entity resolution
+- grouping related entities by Home Assistant device
+- logging of the actual MCP tool arguments during debugging
+
+Do not hardcode the HP printer as the solution. The goal is a generic Home Assistant entity-resolution mechanism.
+
+## 11. Current agent behavior enhancement
+
+The current agent system instructions tell the model to consider related entities belonging to the same device when answering device-status questions. For example, if a printer and its cartridge entities are returned for the same device, the intended answer should contain the printer status and relevant toner levels.
+
+The code must still obey these rules:
+
+- never invent entity IDs
+- never invent states or measurements
+- never invent device relationships
+- use actual MCP results
+- state which entity was used when useful
+
+The enhancement is associated with:
 
 ```text
 ce2a13d Improve device status summaries
 ```
 
-## 7. Current target behavior
+## 12. Security
 
-For a question such as:
+The GitHub repository is public.
 
-> Was macht der Drucker?
-
-The intended response is a concise summary such as:
+Never commit:
 
 ```text
-Der HP Color LaserJet MFP M477fdn ist im Leerlauf.
-Toner: Schwarz 48 %, Cyan 95 %, Magenta 96 %, Gelb 96 %.
+OPENAI_API_KEY
+HA_TOKEN
+passwords
+private keys
+.env files
+other credentials
 ```
 
-The exact wording remains model-generated. Values must always come from Home Assistant tools; the agent must not invent them.
+Secrets are supplied at runtime through Docker environment parameters or local ignored configuration.
 
-## 8. Robustness already implemented
+If a secret is accidentally exposed in shell output, logs, screenshots or Git, revoke and recreate it.
 
-The current implementation includes:
+## 13. Useful QNAP commands
 
-- mandatory configuration validation
-- OpenAI request timeout and retries
-- MCP initialization/tool-discovery/tool-call timeouts
-- maximum model/tool-call rounds
-- validation of requested MCP tools
-- JSON argument validation
-- Home Assistant entity ID validation
-- controlled error responses
-- `/health` endpoint for the agent
-- safe handling of null entity metadata
-- MCP server fallback from WebSocket registries to state data
-- non-root user inside the MCP container
-- restart policy `unless-stopped`
+Check both containers:
 
-## 9. Security rules
+```bash
+docker ps | grep -E 'home-assistant-(mcp|agent)'
+```
 
-The repository is public. Never commit:
+Agent logs:
 
-- `OPENAI_API_KEY`
-- `HA_TOKEN`
-- passwords
-- private keys
-- `.env`
-- other credentials
+```bash
+docker logs --tail 100 home-assistant-agent
+```
 
-Runtime secrets are passed as Docker environment parameters or through local, ignored configuration.
+MCP logs:
 
-If a token is accidentally exposed in shell output or logs, revoke and recreate it.
+```bash
+docker logs --tail 100 home-assistant-mcp
+```
 
-## 10. Next steps
+Agent health:
 
-1. Pull the latest `main` on the Mac and restart the local agent.
-2. Test `Was macht der Drucker?` again and verify status + toner aggregation.
-3. Keep the QNAP MCP server as the stable Home Assistant integration endpoint.
-4. Containerize the agent and deploy it independently from the Mac.
-5. Publish/use a Docker image for the agent so the production runtime is fully containerized.
-6. Add write/action capabilities only after the read path is stable; reminders/automation actions must be implemented explicitly rather than inferred from read-only tools.
-7. Add further entity discovery and natural-language tests.
+```bash
+curl http://192.168.1.232:8080/health
+```
 
-## 11. First milestone definition
+Check agent network identity:
 
-This milestone is considered working when:
+```bash
+docker inspect home-assistant-agent | grep -i -E 'MacAddress|IPAddress|NetworkID'
+```
 
-- the QNAP MCP container starts reliably with DHCP + fixed MAC
-- MCP is reachable on port 8000
-- Home Assistant authentication works
-- entity discovery works
-- current entity state can be retrieved
-- the OpenAI agent can call MCP tools
-- a real Home Assistant device can be queried through natural language
-- no secrets are stored in Git
+Check MCP network identity:
 
-All of the above have been demonstrated for the current read-only path. The remaining work is primarily productionizing the agent container and expanding the tool/action model.
+```bash
+docker inspect home-assistant-mcp | grep -i -E 'MacAddress|IPAddress|NetworkID'
+```
+
+Check agent environment without displaying the secret:
+
+```bash
+docker exec home-assistant-agent python -c "
+import os
+print('MCP_URL:', os.environ.get('MCP_URL'))
+print('MODEL:', os.environ.get('OPENAI_MODEL'))
+print('OPENAI_KEY:', 'gesetzt' if os.environ.get('OPENAI_API_KEY') else 'FEHLT')
+"
+```
+
+Check MCP environment without displaying the token:
+
+```bash
+docker exec home-assistant-mcp python -c "
+import os
+print('HA_URL:', os.environ.get('HA_URL'))
+print('HA_TOKEN:', 'gesetzt' if os.environ.get('HA_TOKEN') else 'FEHLT')
+"
+```
+
+## 14. Rebuild/redeploy workflow
+
+### MCP
+
+```text
+GitHub main
+   -> wget mcp-server files on QNAP
+   -> docker build --no-cache -t home-assistant-mcp ./mcp-server
+   -> recreate home-assistant-mcp
+   -> verify MCP
+```
+
+### Agent
+
+```text
+GitHub main
+   -> wget agent files on QNAP
+   -> docker build --no-cache -t home-assistant-agent ./agent
+   -> recreate home-assistant-agent
+   -> verify /health
+   -> verify browser UI
+   -> verify natural-language request
+```
+
+The Mac is not required for deployment once the GitHub files are available.
+
+## 15. First working milestone
+
+The following read-only path is working:
+
+- QNAP Docker networking
+- DHCP with fixed MAC addresses
+- Home Assistant connectivity
+- Home Assistant authentication
+- MCP Streamable HTTP endpoint
+- entity/device registry discovery
+- current entity state retrieval
+- OpenAI integration
+- MCP tool calling from the AI agent
+- browser UI
+- persistent QNAP agent container
+- persistent QNAP MCP container
+- no credentials stored in Git
+
+The remaining known functional limitation is semantic resolution of generic natural-language device terms such as `Drucker` to entities whose searchable metadata does not contain the literal term `printer`/`drucker`.
+
+## 16. Next session — start here
+
+Before changing code, verify the runtime:
+
+```bash
+cd /share/Container/home-assistant-agent
+
+docker ps | grep -E 'home-assistant-(mcp|agent)'
+
+curl http://192.168.1.232:8080/health
+
+docker logs --tail 30 home-assistant-agent
+```
+
+Then the first development task should be:
+
+**Improve generic natural-language entity resolution without hardcoding specific devices.**
+
+The current HP printer example is the reference test case, but the solution should remain generic for the complete Home Assistant entity registry.

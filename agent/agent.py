@@ -185,7 +185,13 @@ async def chat(request: ChatRequest):
                             "Use get_entity_state when the current state is required. "
                             "If search returns no matching entity, say that the entity was not found. "
                             "Never invent entity IDs, sensor values, device states or measurements. "
-                            "When several entities match, use the most relevant match and state which entity you used."
+                            "When several entities match, use the most relevant match and state which entity you used. "
+                            "When the user asks for the status or condition of a device, inspect the search results for "
+                            "other entities belonging to the same device. Include relevant related status values, "
+                            "such as consumables, temperatures, counters or operating states, when they are present. "
+                            "For example, when a printer search returns its printer status and cartridge entities, "
+                            "report the printer status together with the cartridge levels instead of reporting only the main entity. "
+                            "Do not invent relationships; only group entities when the tool results identify the same device."
                         ),
                     },
                     {"role": "user", "content": request.message},

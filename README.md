@@ -1,19 +1,16 @@
 # Home Assistant AI Agent
 
+[![Docker Build](https://github.com/benjaminschmal/home-assistant-agent/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/benjaminschmal/home-assistant-agent/actions/workflows/docker-publish.yml)
+
 An AI assistant for Home Assistant that combines an OpenAI-powered agent with a dedicated MCP server.
 
-The project is designed as a **two-container architecture**:
-
-- the **Home Assistant Agent** runs as a Docker container
-- the **Home Assistant MCP Server** runs as a Docker container on the QNAP
-
-The repository is intended to be public. Secrets and deployment-specific values are therefore kept outside Git.
+The project uses a **two-container architecture**. Both components are published as independent Docker images to GitHub Container Registry and can be created as normal standalone Docker containers in QNAP Container Station — no Docker Application / Compose stack is required.
 
 ## Architecture
 
 ```text
 ┌──────────────────────────────┐
-│ Docker Host                  │
+│ Docker Host / QNAP           │
 │                              │
 │  home-assistant-agent        │
 │  FastAPI / Uvicorn :8080     │
@@ -21,12 +18,8 @@ The repository is intended to be public. Secrets and deployment-specific values 
 │       ├── OpenAI API         │
 │       │                      │
 │       └── MCP / HTTP         │
-└───────┼──────────────────────┘
-        │
-        ▼
-┌──────────────────────────────┐
-│ QNAP                         │
-│                              │
+│              │               │
+│              ▼               │
 │  home-assistant-mcp          │
 │  MCP Server :8000            │
 │       │                      │
@@ -40,8 +33,7 @@ The agent and MCP server are independent containers. The MCP server is the integ
 ### Components
 
 - `agent/` — AI agent and web UI, packaged as a Docker image.
-- `mcp-server/` — MCP server exposing Home Assistant functionality as tools.
-- `deploy/qnap/` — QNAP deployment template.
+- `mcp-server/` — MCP server exposing Home Assistant functionality as a Docker image.
 
 The current MCP server provides two tools:
 
@@ -50,38 +42,64 @@ The current MCP server provides two tools:
 
 The agent discovers the MCP tools at runtime and exposes them to the OpenAI model. The agent is instructed to search for an entity first and retrieve its state when required; it must not invent sensor values.
 
+## Docker Images
+
+GitHub Actions automatically builds and publishes both images to **GitHub Container Registry (GHCR)** whenever changes are pushed to `main`.
+
+### Agent
+
+```text
+ghcr.io/benjaminschmal/home-assistant-agent:latest
+```
+
+### MCP Server
+
+```text
+ghcr.io/benjaminschmal/home-assistant-mcp:latest
+```
+
+Commit-specific image tags are also published using the Git SHA for reproducible deployments.
+
+The Docker workflow is located at:
+
+```text
+.github/workflows/docker-publish.yml
+```
+
+The **Docker Build** badge at the top of this README shows the current workflow status. It is green when both Docker images were successfully built and published.
+
 ## Requirements
 
-### Agent host
+### Docker host
 
 - Docker
-- Docker Compose or equivalent Docker runtime
 - OpenAI API key
-- Network access to the QNAP MCP server
+- Network access between the agent and MCP server
+- Network access from the MCP server to Home Assistant
 
 ### QNAP
 
-- Docker
-- Docker Compose
-- Persistent QNAP network
+- QNAP Container Station
+- Docker support
 - Home Assistant reachable from the MCP container
+- Optional persistent QNAP network if a fixed MAC/IP is required
 
 ## Configuration
 
 Secrets are deliberately kept outside Git. `.env` is ignored by Git and `.env.example` contains only placeholders.
 
-The environment file contains the configuration for both application components when used for deployment:
+The required environment variables are:
 
 ```text
 OPENAI_API_KEY=<your-openai-api-key>
 OPENAI_MODEL=gpt-5
-MCP_URL=http://<QNAP_IP>:8000/mcp
+MCP_URL=http://<MCP_HOST>:8000/mcp
 MCP_TIMEOUT_SECONDS=15
 OPENAI_TIMEOUT_SECONDS=60
 MAX_TOOL_ROUNDS=5
 LOG_LEVEL=INFO
 
-HA_URL=http://<HOME_ASSISTANT_IP>:8123
+HA_URL=http://<HOME_ASSISTANT_HOST>:8123
 HA_TOKEN=<home-assistant-long-lived-access-token>
 HA_TIMEOUT_SECONDS=15
 MAX_SEARCH_RESULTS=50
@@ -91,65 +109,148 @@ The agent validates its required configuration at startup. The MCP server likewi
 
 **Never commit `.env`, API keys, Home Assistant tokens, passwords or other secrets.**
 
-## Agent deployment
+## QNAP Deployment — Standalone Containers
 
-The agent is intended to run **as a Docker container**, not as a Python process on a developer workstation.
+Both components can be created directly in **QNAP Container Station → Create Container**. No Compose file and no QNAP Application are required.
 
-Build the agent image from the repository root:
+### Container 1 — Home Assistant MCP
+
+Use the following image:
+
+```text
+ghcr.io/benjaminschmal/home-assistant-mcp:latest
+```
+
+Recommended container name:
+
+```text
+home-assistant-mcp
+```
+
+Port mapping:
+
+```text
+Container port: 8000
+Host port:      8000
+Protocol:       TCP
+```
+
+Environment variables:
+
+```text
+HA_URL=http://<HOME_ASSISTANT_HOST>:8123
+HA_TOKEN=<home-assistant-long-lived-access-token>
+HA_TIMEOUT_SECONDS=15
+MAX_SEARCH_RESULTS=50
+```
+
+If the QNAP installation uses a persistent external network with a fixed MAC address, configure that network and MAC address directly in Container Station. Do not store those installation-specific values in the public repository.
+
+### Container 2 — Home Assistant Agent
+
+Use the following image:
+
+```text
+ghcr.io/benjaminschmal/home-assistant-agent:latest
+```
+
+Recommended container name:
+
+```text
+home-assistant-agent
+```
+
+Port mapping:
+
+```text
+Container port: 8080
+Host port:      8080
+Protocol:       TCP
+```
+
+Environment variables:
+
+```text
+OPENAI_API_KEY=<your-openai-api-key>
+OPENAI_MODEL=gpt-5
+MCP_URL=http://<MCP_HOST>:8000/mcp
+MCP_TIMEOUT_SECONDS=15
+OPENAI_TIMEOUT_SECONDS=60
+MAX_TOOL_ROUNDS=5
+LOG_LEVEL=INFO
+```
+
+Set both containers to:
+
+```text
+Restart policy: unless-stopped
+```
+
+The resulting QNAP setup is intentionally simple:
+
+```text
+DOCKER
+├── home-assistant-mcp
+│   └── ghcr.io/benjaminschmal/home-assistant-mcp:latest
+│
+└── home-assistant-agent
+    └── ghcr.io/benjaminschmal/home-assistant-agent:latest
+```
+
+The **Application** column should remain empty (`--`) for both containers.
+
+## Manual Docker Deployment
+
+The same images can be deployed on any Docker host without QNAP Container Station.
+
+### MCP server
+
+```bash
+docker run -d \
+  --name home-assistant-mcp \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  -e HA_URL=http://<HOME_ASSISTANT_HOST>:8123 \
+  -e HA_TOKEN='<HOME_ASSISTANT_TOKEN>' \
+  -e HA_TIMEOUT_SECONDS=15 \
+  -e MAX_SEARCH_RESULTS=50 \
+  ghcr.io/benjaminschmal/home-assistant-mcp:latest
+```
+
+### Agent
+
+```bash
+docker run -d \
+  --name home-assistant-agent \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e OPENAI_API_KEY='<OPENAI_API_KEY>' \
+  -e OPENAI_MODEL=gpt-5 \
+  -e MCP_URL=http://<MCP_HOST>:8000/mcp \
+  -e MCP_TIMEOUT_SECONDS=15 \
+  -e OPENAI_TIMEOUT_SECONDS=60 \
+  -e MAX_TOOL_ROUNDS=5 \
+  -e LOG_LEVEL=INFO \
+  ghcr.io/benjaminschmal/home-assistant-agent:latest
+```
+
+The agent web UI is available on port `8080`. The MCP server listens on port `8000`.
+
+## Development Builds
+
+Build the agent locally from the repository root:
 
 ```bash
 docker build -t home-assistant-agent ./agent
 ```
 
-Run it with the environment file:
-
-```bash
-docker run -d \
-  --name home-assistant-agent \
-  --env-file .env \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  home-assistant-agent:latest
-```
-
-The web UI is available on port `8080` of the Docker host. A lightweight health endpoint is available at `/health`.
-
-The container contains Python, the required dependencies and the application itself. No local Python installation is required on the Docker host.
-
-## QNAP MCP deployment
-
-The MCP server is the persistent integration point to Home Assistant and is deployed on the QNAP.
-
-Build the MCP image from the repository root:
+Build the MCP server locally:
 
 ```bash
 docker build -t home-assistant-mcp ./mcp-server
 ```
 
-The QNAP deployment uses an external Docker network and a fixed MAC address. Copy the example file from:
-
-```text
-deploy/qnap/docker-compose.yml.example
-```
-
-and replace the placeholders with the real deployment values on the QNAP.
-
-The deployment template uses:
-
-- container name `home-assistant-mcp`
-- port `8000`
-- external QNAP network
-- explicit MAC address
-- `.env` for secrets
-- `restart: unless-stopped`
-
-Example deployment:
-
-```bash
-docker compose up -d
-```
-
-The exact QNAP network name and MAC address are intentionally not stored in the public repository.
+The GitHub Actions workflow is the standard production build and publishing path.
 
 ## End-to-end operation
 
@@ -191,7 +292,7 @@ The runtime is deliberately defensive:
 - invalid Home Assistant entity IDs are rejected
 - Home Assistant HTTP errors are logged without exposing the access token
 - the agent returns controlled error responses instead of exposing full unexpected exception details to the browser
-- `/health` provides a basic container health check
+- `/health` provides a basic agent container health check
 
 Entity search ranks matches instead of returning the first arbitrary substring matches. It considers normalized entity IDs, friendly names, device classes and current states.
 
@@ -203,8 +304,6 @@ The repository contains a small MCP client for connectivity and tool testing:
 mcp-server/test_client.py
 ```
 
-It can be run against the QNAP MCP endpoint from a container or a Python environment with the MCP dependencies installed.
-
 The first basic checks should be:
 
 1. MCP endpoint is reachable.
@@ -213,23 +312,6 @@ The first basic checks should be:
 4. `get_entity_state` returns its current state.
 5. The agent can use those tools through OpenAI tool calling.
 6. `GET /health` returns `status: ok` on the agent container.
-
-## Development workflow
-
-Development should follow the containerized deployment model:
-
-```text
-1. Change code locally
-2. Build/test the Docker image
-3. Test the agent against the QNAP MCP server
-4. Commit changes
-5. Push to GitHub
-6. Pull on the target Docker host
-7. Rebuild/redeploy the changed container
-8. Test end-to-end
-```
-
-The agent and MCP server can be developed independently. A change under `agent/` requires rebuilding the agent image. A change under `mcp-server/` requires rebuilding and redeploying the MCP image on the QNAP.
 
 ## Security
 

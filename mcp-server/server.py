@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import uvicorn
+import websockets
 
 from mcp.server import Server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
@@ -52,6 +53,42 @@ async def ha_get(path: str) -> Any:
         raise RuntimeError("Home Assistant request failed") from exc
 
 
+async def ha_ws_command(command_type: str) -> Any:
+    ws_url = HA_URL.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + "/api/websocket"
+
+    try:
+        async with websockets.connect(ws_url, open_timeout=HA_TIMEOUT, close_timeout=HA_TIMEOUT) as websocket:
+            hello = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
+            if hello.get("type") != "auth_required":
+                raise RuntimeError("Unexpected Home Assistant WebSocket handshake")
+
+            await websocket.send(json.dumps({
+                "type": "auth",
+                "access_token": HA_TOKEN,
+            }))
+            auth = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
+            if auth.get("type") != "auth_ok":
+                raise RuntimeError("Home Assistant WebSocket authentication failed")
+
+            await websocket.send(json.dumps({
+                "id": 1,
+                "type": command_type,
+            }))
+
+            while True:
+                message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
+                if message.get("id") != 1:
+                    continue
+                if not message.get("success"):
+                    raise RuntimeError(f"Home Assistant WebSocket command failed: {command_type}")
+                return message.get("result")
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"Home Assistant WebSocket request timed out after {HA_TIMEOUT:.0f}s") from exc
+    except websockets.WebSocketException as exc:
+        logger.warning("Home Assistant WebSocket request failed: %s", type(exc).__name__)
+        raise RuntimeError("Home Assistant WebSocket request failed") from exc
+
+
 def normalize(value: str) -> str:
     value = value.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
@@ -68,6 +105,7 @@ def search_score(query: str, entity: dict[str, Any], registry_text: str = "") ->
         "entity_id": normalize(entity.get("entity_id", "")),
         "device_class": normalize(entity.get("device_class", "")),
         "state": normalize(str(entity.get("state", ""))),
+        "domain": normalize(entity.get("domain", "")),
         "registry": normalize(registry_text),
     }
 
@@ -81,6 +119,8 @@ def search_score(query: str, entity: dict[str, Any], registry_text: str = "") ->
             score += 70
         elif term in searchable["device_class"]:
             score += 50
+        elif term in searchable["domain"]:
+            score += 30
         elif term in searchable["state"]:
             score += 5
 
@@ -103,18 +143,28 @@ def registry_text(entity_registry_entry: dict[str, Any], device: dict[str, Any] 
             device.get("name_by_user"),
             device.get("manufacturer"),
             device.get("model"),
+            device.get("model_id"),
             device.get("sw_version"),
             device.get("hw_version"),
         ])
     return " ".join(str(value) for value in values if value)
 
 
+async def load_registries() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        entity_registry, device_registry = await asyncio.gather(
+            ha_ws_command("config/entity_registry/list"),
+            ha_ws_command("config/device_registry/list"),
+        )
+        return entity_registry or [], device_registry or []
+    except RuntimeError as exc:
+        logger.warning("Could not load Home Assistant registries; using state data only: %s", exc)
+        return [], []
+
+
 async def build_entity_index() -> list[dict[str, Any]]:
-    states, entity_registry, device_registry = await asyncio.gather(
-        ha_get("/api/states"),
-        ha_get("/api/config/entity_registry/list"),
-        ha_get("/api/config/device_registry/list"),
-    )
+    states = await ha_get("/api/states")
+    entity_registry, device_registry = await load_registries()
 
     devices_by_id = {
         device.get("id"): device
@@ -133,6 +183,7 @@ async def build_entity_index() -> list[dict[str, Any]]:
         attributes = state.get("attributes", {}) or {}
         registry_entry = registry_by_entity_id.get(entity_id, {})
         device = devices_by_id.get(registry_entry.get("device_id"))
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
 
         indexed.append({
             "entity_id": entity_id,
@@ -140,6 +191,7 @@ async def build_entity_index() -> list[dict[str, Any]]:
             "state": state.get("state"),
             "unit_of_measurement": attributes.get("unit_of_measurement"),
             "device_class": attributes.get("device_class"),
+            "domain": domain,
             "device_name": (device or {}).get("name_by_user") or (device or {}).get("name"),
             "manufacturer": (device or {}).get("manufacturer"),
             "model": (device or {}).get("model"),
@@ -156,7 +208,7 @@ async def list_tools(context, params) -> ListToolsResult:
                 name="search_entities",
                 description=(
                     "Search Home Assistant entities by entity ID, friendly name, device name, "
-                    "manufacturer, model, device class or current state. Use this before "
+                    "manufacturer, model, device class, domain or current state. Use this before "
                     "get_entity_state when the exact entity ID is unknown."
                 ),
                 inputSchema={
@@ -198,7 +250,8 @@ async def call_tool(context, params) -> CallToolResult:
         results = []
 
         for entity in indexed_entities:
-            score = search_score(query, entity, entity.pop("registry_text", ""))
+            registry_text_value = entity.pop("registry_text", "")
+            score = search_score(query, entity, registry_text_value)
             if score > 0:
                 entity["_score"] = score
                 results.append(entity)
@@ -206,8 +259,6 @@ async def call_tool(context, params) -> CallToolResult:
         results.sort(key=lambda item: (-item.pop("_score"), item["entity_id"]))
         logger.info("Entity search '%s' returned %d results", query, len(results))
 
-        # Keep the tool response compact while retaining enough device context
-        # for the model to identify the correct entity.
         for result in results:
             if not result.get("device_name"):
                 result.pop("device_name", None)
@@ -247,7 +298,7 @@ async def call_tool(context, params) -> CallToolResult:
 
 server = Server(
     "home-assistant-mcp",
-    version="1.2.0",
+    version="1.3.0",
     on_list_tools=list_tools,
     on_call_tool=call_tool,
 )

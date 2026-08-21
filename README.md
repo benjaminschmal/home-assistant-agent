@@ -45,7 +45,7 @@ The agent and MCP server are independent containers. The MCP server is the integ
 
 The current MCP server provides two tools:
 
-- `search_entities` — searches Home Assistant entities by entity ID or friendly name.
+- `search_entities` — searches Home Assistant entities by entity ID, friendly name, device class and current state.
 - `get_entity_state` — retrieves the current state and attributes of an entity.
 
 The agent discovers the MCP tools at runtime and exposes them to the OpenAI model. The agent is instructed to search for an entity first and retrieve its state when required; it must not invent sensor values.
@@ -76,12 +76,18 @@ The environment file contains the configuration for both application components 
 OPENAI_API_KEY=<your-openai-api-key>
 OPENAI_MODEL=gpt-5
 MCP_URL=http://<QNAP_IP>:8000/mcp
+MCP_TIMEOUT_SECONDS=15
+OPENAI_TIMEOUT_SECONDS=60
+MAX_TOOL_ROUNDS=5
+LOG_LEVEL=INFO
 
 HA_URL=http://<HOME_ASSISTANT_IP>:8123
 HA_TOKEN=<home-assistant-long-lived-access-token>
+HA_TIMEOUT_SECONDS=15
+MAX_SEARCH_RESULTS=50
 ```
 
-The agent loads the OpenAI configuration and `MCP_URL` from its environment. The MCP server reads `HA_URL` and `HA_TOKEN` from its environment.
+The agent validates its required configuration at startup. The MCP server likewise requires `HA_URL` and `HA_TOKEN`. Timeouts and tool-call limits prevent a failed dependency or runaway tool loop from hanging the service indefinitely.
 
 **Never commit `.env`, API keys, Home Assistant tokens, passwords or other secrets.**
 
@@ -101,19 +107,14 @@ Run it with the environment file:
 docker run -d \
   --name home-assistant-agent \
   --env-file .env \
+  --restart unless-stopped \
   -p 8080:8080 \
   home-assistant-agent:latest
 ```
 
-The web UI is then available on port `8080` of the Docker host.
+The web UI is available on port `8080` of the Docker host. A lightweight health endpoint is available at `/health`.
 
-For production or permanent deployment, use the same image through Docker Compose or another container deployment mechanism. The container should be restarted automatically, for example with:
-
-```yaml
-restart: unless-stopped
-```
-
-The agent image contains Python, the required Python dependencies and the application itself. No local Python installation is required on the Docker host.
+The container contains Python, the required dependencies and the application itself. No local Python installation is required on the Docker host.
 
 ## QNAP MCP deployment
 
@@ -177,6 +178,23 @@ Home Assistant :8123
 
 The agent sends the user's request to the OpenAI model together with the tools discovered from the MCP server. When the model decides that Home Assistant data is required, the agent calls the corresponding MCP tool and sends the result back to the model for the final response.
 
+## Robustness and error handling
+
+The runtime is deliberately defensive:
+
+- required secrets and endpoints are validated during startup
+- OpenAI requests have a configurable timeout and SDK retries
+- MCP initialization, tool discovery and tool calls have configurable timeouts
+- the number of model/tool rounds is limited
+- invalid JSON tool arguments are rejected
+- tool names are validated against the MCP tool list
+- invalid Home Assistant entity IDs are rejected
+- Home Assistant HTTP errors are logged without exposing the access token
+- the agent returns controlled error responses instead of exposing full unexpected exception details to the browser
+- `/health` provides a basic container health check
+
+Entity search ranks matches instead of returning the first arbitrary substring matches. It considers normalized entity IDs, friendly names, device classes and current states.
+
 ## Testing the MCP server
 
 The repository contains a small MCP client for connectivity and tool testing:
@@ -194,6 +212,7 @@ The first basic checks should be:
 3. `search_entities` finds a known Home Assistant entity.
 4. `get_entity_state` returns its current state.
 5. The agent can use those tools through OpenAI tool calling.
+6. `GET /health` returns `status: ok` on the agent container.
 
 ## Development workflow
 

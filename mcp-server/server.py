@@ -57,33 +57,96 @@ def normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
-def search_score(query: str, entity: dict[str, Any]) -> int:
+def search_score(query: str, entity: dict[str, Any], registry_text: str = "") -> int:
     normalized_query = normalize(query)
     if not normalized_query:
         return 0
 
     terms = normalized_query.split()
-    entity_id = normalize(entity.get("entity_id", ""))
-    friendly_name = normalize(entity.get("friendly_name", ""))
-    device_class = normalize(entity.get("device_class", ""))
-    state = normalize(str(entity.get("state", "")))
+    searchable = {
+        "friendly_name": normalize(entity.get("friendly_name", "")),
+        "entity_id": normalize(entity.get("entity_id", "")),
+        "device_class": normalize(entity.get("device_class", "")),
+        "state": normalize(str(entity.get("state", ""))),
+        "registry": normalize(registry_text),
+    }
 
     score = 0
     for term in terms:
-        if term in friendly_name:
+        if term in searchable["friendly_name"]:
             score += 100
-        elif term in entity_id:
+        elif term in searchable["registry"]:
+            score += 90
+        elif term in searchable["entity_id"]:
             score += 70
-        elif term in device_class:
+        elif term in searchable["device_class"]:
             score += 50
-        elif term in state:
+        elif term in searchable["state"]:
             score += 5
 
-    if normalized_query == friendly_name:
+    if normalized_query == searchable["friendly_name"]:
         score += 100
-    if normalized_query == entity_id:
+    if normalized_query == searchable["entity_id"]:
         score += 80
     return score
+
+
+def registry_text(entity_registry_entry: dict[str, Any], device: dict[str, Any] | None) -> str:
+    values = [
+        entity_registry_entry.get("name"),
+        entity_registry_entry.get("original_name"),
+        entity_registry_entry.get("platform"),
+    ]
+    if device:
+        values.extend([
+            device.get("name"),
+            device.get("name_by_user"),
+            device.get("manufacturer"),
+            device.get("model"),
+            device.get("sw_version"),
+            device.get("hw_version"),
+        ])
+    return " ".join(str(value) for value in values if value)
+
+
+async def build_entity_index() -> list[dict[str, Any]]:
+    states, entity_registry, device_registry = await asyncio.gather(
+        ha_get("/api/states"),
+        ha_get("/api/config/entity_registry/list"),
+        ha_get("/api/config/device_registry/list"),
+    )
+
+    devices_by_id = {
+        device.get("id"): device
+        for device in device_registry
+        if device.get("id")
+    }
+    registry_by_entity_id = {
+        entry.get("entity_id"): entry
+        for entry in entity_registry
+        if entry.get("entity_id")
+    }
+
+    indexed = []
+    for state in states:
+        entity_id = state.get("entity_id", "")
+        attributes = state.get("attributes", {}) or {}
+        registry_entry = registry_by_entity_id.get(entity_id, {})
+        device = devices_by_id.get(registry_entry.get("device_id"))
+
+        indexed.append({
+            "entity_id": entity_id,
+            "friendly_name": attributes.get("friendly_name", ""),
+            "state": state.get("state"),
+            "unit_of_measurement": attributes.get("unit_of_measurement"),
+            "device_class": attributes.get("device_class"),
+            "device_name": (device or {}).get("name_by_user") or (device or {}).get("name"),
+            "manufacturer": (device or {}).get("manufacturer"),
+            "model": (device or {}).get("model"),
+            "registry_text": registry_text(registry_entry, device),
+        })
+
+    return indexed
 
 
 async def list_tools(context, params) -> ListToolsResult:
@@ -92,16 +155,16 @@ async def list_tools(context, params) -> ListToolsResult:
             Tool(
                 name="search_entities",
                 description=(
-                    "Search Home Assistant entities by entity ID, friendly name, "
-                    "device class or current state. Use this before get_entity_state "
-                    "when the exact entity ID is unknown."
+                    "Search Home Assistant entities by entity ID, friendly name, device name, "
+                    "manufacturer, model, device class or current state. Use this before "
+                    "get_entity_state when the exact entity ID is unknown."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search terms such as 'vorlauf', 'temperature', 'drucker' or 'carel'.",
+                            "description": "Search terms such as 'vorlauf', 'temperature', 'drucker', 'HP' or 'carel'.",
                         }
                     },
                     "required": ["query"],
@@ -109,9 +172,7 @@ async def list_tools(context, params) -> ListToolsResult:
             ),
             Tool(
                 name="get_entity_state",
-                description=(
-                    "Get the current state and attributes of one Home Assistant entity."
-                ),
+                description="Get the current state and attributes of one Home Assistant entity.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -133,25 +194,27 @@ async def call_tool(context, params) -> CallToolResult:
         if not query:
             raise ValueError("query is required")
 
-        states = await ha_get("/api/states")
+        indexed_entities = await build_entity_index()
         results = []
 
-        for entity in states:
-            attributes = entity.get("attributes", {}) or {}
-            result = {
-                "entity_id": entity.get("entity_id", ""),
-                "friendly_name": attributes.get("friendly_name", ""),
-                "state": entity.get("state"),
-                "unit_of_measurement": attributes.get("unit_of_measurement"),
-                "device_class": attributes.get("device_class"),
-            }
-            score = search_score(query, result)
+        for entity in indexed_entities:
+            score = search_score(query, entity, entity.pop("registry_text", ""))
             if score > 0:
-                result["_score"] = score
-                results.append(result)
+                entity["_score"] = score
+                results.append(entity)
 
         results.sort(key=lambda item: (-item.pop("_score"), item["entity_id"]))
         logger.info("Entity search '%s' returned %d results", query, len(results))
+
+        # Keep the tool response compact while retaining enough device context
+        # for the model to identify the correct entity.
+        for result in results:
+            if not result.get("device_name"):
+                result.pop("device_name", None)
+            if not result.get("manufacturer"):
+                result.pop("manufacturer", None)
+            if not result.get("model"):
+                result.pop("model", None)
 
         return CallToolResult(
             content=[
@@ -184,7 +247,7 @@ async def call_tool(context, params) -> CallToolResult:
 
 server = Server(
     "home-assistant-mcp",
-    version="1.1.0",
+    version="1.2.0",
     on_list_tools=list_tools,
     on_call_tool=call_tool,
 )

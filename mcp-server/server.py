@@ -89,7 +89,10 @@ async def ha_ws_command(command_type: str) -> Any:
         raise RuntimeError("Home Assistant WebSocket request failed") from exc
 
 
-def normalize(value: str) -> str:
+def normalize(value: Any) -> str:
+    if value is None:
+        return ""
+    value = str(value)
     value = value.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 

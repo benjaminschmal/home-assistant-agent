@@ -101,7 +101,25 @@ def backup_path(path: Path) -> Path:
 def validate_yaml(text: str) -> None:
     try:
         import yaml
-        yaml.safe_load(text)
+        from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+        class HomeAssistantLoader(yaml.SafeLoader):
+            pass
+
+        def construct_home_assistant_tag(loader, tag_suffix, node):
+            if isinstance(node, ScalarNode):
+                return loader.construct_scalar(node)
+            if isinstance(node, SequenceNode):
+                return loader.construct_sequence(node)
+            if isinstance(node, MappingNode):
+                return loader.construct_mapping(node)
+            return None
+
+        # Home Assistant extends YAML with tags such as !include, !secret,
+        # !env_var and !input. For validation we only need their YAML shape;
+        # they must not be resolved or executed.
+        HomeAssistantLoader.add_multi_constructor("!", construct_home_assistant_tag)
+        yaml.load(text, Loader=HomeAssistantLoader)
     except ImportError:
         raise RuntimeError("PyYAML is required for configuration validation")
     except yaml.YAMLError as exc:

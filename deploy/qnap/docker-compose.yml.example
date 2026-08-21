@@ -1,0 +1,25 @@
+services:
+
+  home-assistant-mcp:
+
+    image: home-assistant-mcp:latest
+
+    container_name: home-assistant-mcp
+
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    ports:
+      - "8000:8000"
+
+    networks:
+      qnet:
+        mac_address: "<MAC_ADDRESS>"
+
+networks:
+
+  qnet:
+    external: true
+    name: "<QNAP_NETWORK>"

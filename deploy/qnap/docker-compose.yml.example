@@ -22,4 +22,4 @@ networks:
 
   qnet:
     external: true
-    name: "<QNAP_NETWORK>"
+    name: "qnet-dhcp-bond0-6d6da6"

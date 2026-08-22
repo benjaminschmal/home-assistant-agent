@@ -102,56 +102,63 @@ def validate_yaml(text: str) -> None:
     try:
         import yaml
         from yaml.nodes import MappingNode, ScalarNode, SequenceNode
-
-        class HomeAssistantLoader(yaml.SafeLoader):
-            pass
-
-        def construct_home_assistant_tag(loader, tag_suffix, node):
+        class HomeAssistantLoader(yaml.SafeLoader): pass
+        def construct_tag(loader, tag_suffix, node):
             if isinstance(node, ScalarNode): return loader.construct_scalar(node)
             if isinstance(node, SequenceNode): return loader.construct_sequence(node)
             if isinstance(node, MappingNode): return loader.construct_mapping(node)
             return None
-
-        HomeAssistantLoader.add_multi_constructor("!", construct_home_assistant_tag)
+        HomeAssistantLoader.add_multi_constructor("!", construct_tag)
         yaml.load(text, Loader=HomeAssistantLoader)
-    except ImportError:
-        raise RuntimeError("PyYAML is required for configuration validation")
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required for configuration validation") from exc
     except yaml.YAMLError as exc:
         raise ValueError(f"Invalid YAML: {exc}") from exc
 
 
 def read_config_file(filename: str) -> str:
-    if not ALLOW_CONFIGURATION: raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
+    if not ALLOW_CONFIGURATION:
+        raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
     path = config_file_path(filename)
-    if not path.exists(): raise FileNotFoundError(f"Configuration file '{filename}' does not exist")
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file '{filename}' does not exist")
     return path.read_text(encoding="utf-8")
 
 
 def update_config_file(filename: str, content: str) -> dict[str, Any]:
-    if not ALLOW_CONFIGURATION: raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
-    if not isinstance(content, str) or not content.strip(): raise ValueError("content must be a non-empty string")
+    if not ALLOW_CONFIGURATION:
+        raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("content must be a non-empty string")
     path = config_file_path(filename)
     validate_yaml(content)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists(): path.replace(backup_path(path))
+    if path.exists():
+        path.replace(backup_path(path))
     path.write_text(content, encoding="utf-8")
-    return {"success": True, "file": filename, "backup": str(backup_path(path).name), "validated": True}
+    return {"success": True, "file": filename, "backup": backup_path(path).name, "validated": True}
 
 
-async def ha_ws_command(command_type: str) -> Any:
+async def ha_ws_command(command_type: str, payload: dict[str, Any] | None = None) -> Any:
     ws_url = HA_URL.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + "/api/websocket"
     async with websockets.connect(ws_url, open_timeout=HA_TIMEOUT, close_timeout=HA_TIMEOUT) as websocket:
         hello = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
-        if hello.get("type") != "auth_required": raise RuntimeError("Unexpected Home Assistant WebSocket handshake")
+        if hello.get("type") != "auth_required":
+            raise RuntimeError("Unexpected Home Assistant WebSocket handshake")
         await websocket.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
         auth = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
-        if auth.get("type") != "auth_ok": raise RuntimeError("Home Assistant WebSocket authentication failed")
-        await websocket.send(json.dumps({"id": 1, "type": command_type}))
+        if auth.get("type") != "auth_ok":
+            raise RuntimeError("Home Assistant WebSocket authentication failed")
+        message = {"id": 1, "type": command_type}
+        if payload:
+            message.update(payload)
+        await websocket.send(json.dumps(message))
         while True:
-            message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
-            if message.get("id") == 1:
-                if not message.get("success"): raise RuntimeError(f"Home Assistant WebSocket command failed: {command_type}")
-                return message.get("result")
+            response = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
+            if response.get("id") == 1:
+                if not response.get("success"):
+                    error = response.get("error", {})
+                    raise RuntimeError(f"Home Assistant WebSocket command failed: {error.get('message', command_type)}")
+                return response.get("result")
 
 
 async def list_ha_services() -> list[dict[str, Any]]:
@@ -159,12 +166,31 @@ async def list_ha_services() -> list[dict[str, Any]]:
     services = []
     for domain, domain_services in (result or {}).items():
         for service, definition in (domain_services or {}).items():
-            services.append({
-                "service": f"{domain}.{service}",
-                "name": definition.get("name") if isinstance(definition, dict) else None,
-                "description": definition.get("description") if isinstance(definition, dict) else None,
-            })
+            services.append({"service": f"{domain}.{service}", "name": definition.get("name") if isinstance(definition, dict) else None, "description": definition.get("description") if isinstance(definition, dict) else None})
     return sorted(services, key=lambda item: item["service"])
+
+
+async def list_dashboards() -> list[dict[str, Any]]:
+    return await ha_ws_command("lovelace/dashboards/list") or []
+
+
+async def get_dashboard(url_path: str | None) -> dict[str, Any]:
+    payload = {} if url_path in (None, "", "lovelace") else {"url_path": url_path}
+    return await ha_ws_command("lovelace/config", payload) or {}
+
+
+async def save_dashboard(url_path: str | None, config: dict[str, Any]) -> Any:
+    payload = {"config": config}
+    if url_path not in (None, "", "lovelace"):
+        payload["url_path"] = url_path
+    return await ha_ws_command("lovelace/config/save", payload)
+
+
+async def create_dashboard(url_path: str, title: str, icon: str = "mdi:view-dashboard", show_in_sidebar: bool = True, require_admin: bool = False) -> Any:
+    if "-" not in url_path:
+        raise ValueError("Dashboard url_path must contain a hyphen, e.g. printer-dashboard")
+    payload = {"url_path": url_path, "title": title, "icon": icon, "show_in_sidebar": show_in_sidebar, "require_admin": require_admin}
+    return await ha_ws_command("lovelace/dashboards/create", payload)
 
 
 def normalize(value: Any) -> str:
@@ -212,66 +238,81 @@ async def build_entity_index() -> list[dict[str, Any]]:
 
 async def list_tools(context, params) -> ListToolsResult:
     tools = [
-        Tool(name="search_entities", description="Search Home Assistant entities. Empty query lists available entities.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}}),
-        Tool(name="get_entity_state", description="Get the current state and attributes of one Home Assistant entity.", inputSchema={"type": "object", "properties": {"entity_id": {"type": "string"}}, "required": ["entity_id"]}),
-        Tool(name="list_services", description="List services currently registered by Home Assistant. Use this to discover available actions before attempting a service call.", inputSchema={"type": "object", "properties": {"query": {"type": "string", "description": "Optional filter such as printer, print, light or climate."}}}),
-        Tool(name="call_service", description="Call an allowed Home Assistant service to control a device or entity.", inputSchema={"type": "object", "properties": {"domain": {"type": "string"}, "service": {"type": "string"}, "service_data": {"type": "object"}}, "required": ["domain", "service", "service_data"]}),
-        Tool(name="configuration_status", description="Show whether configuration editing is enabled and which YAML files are allowed.", inputSchema={"type": "object", "properties": {}}),
-        Tool(name="read_config", description="Read an allowed Home Assistant YAML configuration file. Requires configuration editing to be enabled.", inputSchema={"type": "object", "properties": {"filename": {"type": "string", "enum": sorted(ALLOWED_CONFIG_FILES)}}, "required": ["filename"]}),
-        Tool(name="update_config", description="Replace an allowed Home Assistant YAML configuration file. The new YAML is validated and the existing file is backed up before writing. Requires configuration editing to be enabled.", inputSchema={"type": "object", "properties": {"filename": {"type": "string", "enum": sorted(ALLOWED_CONFIG_FILES)}, "content": {"type": "string"}}, "required": ["filename", "content"]}),
+        Tool(name="search_entities", description="Search Home Assistant entities. Empty query lists available entities.", inputSchema={"type":"object","properties":{"query":{"type":"string"}}}),
+        Tool(name="get_entity_state", description="Get the current state and attributes of one Home Assistant entity.", inputSchema={"type":"object","properties":{"entity_id":{"type":"string"}},"required":["entity_id"]}),
+        Tool(name="list_services", description="List services currently registered by Home Assistant. Use this to discover available actions before attempting a service call.", inputSchema={"type":"object","properties":{"query":{"type":"string","description":"Optional filter such as printer, print, light or climate."}}}),
+        Tool(name="call_service", description="Call an allowed Home Assistant service to control a device or entity.", inputSchema={"type":"object","properties":{"domain":{"type":"string"},"service":{"type":"string"},"service_data":{"type":"object"}},"required":["domain","service","service_data"]}),
+        Tool(name="configuration_status", description="Show whether configuration editing is enabled and which YAML files are allowed.", inputSchema={"type":"object","properties":{}}),
+        Tool(name="read_config", description="Read an allowed Home Assistant YAML configuration file. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"filename":{"type":"string","enum":sorted(ALLOWED_CONFIG_FILES)}},"required":["filename"]}),
+        Tool(name="update_config", description="Replace an allowed Home Assistant YAML configuration file. The new YAML is validated and the existing file is backed up before writing. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"filename":{"type":"string","enum":sorted(ALLOWED_CONFIG_FILES)},"content":{"type":"string"}},"required":["filename","content"]}),
+        Tool(name="list_dashboards", description="List Home Assistant Lovelace dashboards. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{}}),
+        Tool(name="read_dashboard", description="Read the current Lovelace dashboard configuration. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"url_path":{"type":"string","description":"Dashboard URL path. Omit for the default Overview dashboard."}}}),
+        Tool(name="create_dashboard", description="Create a storage-mode Lovelace dashboard. Requires configuration editing to be enabled. The URL path must contain a hyphen.", inputSchema={"type":"object","properties":{"url_path":{"type":"string"},"title":{"type":"string"},"icon":{"type":"string"},"show_in_sidebar":{"type":"boolean"},"require_admin":{"type":"boolean"}},"required":["url_path","title"]}),
+        Tool(name="update_dashboard", description="Save a complete storage-mode Lovelace dashboard configuration. Read the dashboard first, preserve unrelated content, then make the smallest requested change. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"url_path":{"type":"string"},"config":{"type":"object"}},"required":["url_path","config"]}),
     ]
     return ListToolsResult(tools=tools)
 
 
 async def call_tool(context, params) -> CallToolResult:
+    args = params.arguments or {}
     if params.name == "search_entities":
-        query = str(params.arguments.get("query", "")).strip()
-        entities = await build_entity_index()
+        query = str(args.get("query", "")).strip(); entities = await build_entity_index(); results = entities
         if query:
-            results = []
+            scored=[]
             for entity in entities:
-                score = search_score(query, entity, entity.pop("registry_text", ""))
-                if score > 0:
-                    entity["_score"] = score
-                    results.append(entity)
-            results.sort(key=lambda x: (-x.pop("_score"), x["entity_id"]))
-        else: results = entities
+                score=search_score(query, entity, entity.get("registry_text", ""))
+                if score: entity["_score"]=score; scored.append(entity)
+            scored.sort(key=lambda x:(-x.pop("_score"),x["entity_id"])); results=scored
         for result in results:
             result.pop("registry_text", None)
-            for key in ("device_name", "manufacturer", "model"):
-                if not result.get(key): result.pop(key, None)
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(results[:MAX_SEARCH_RESULTS], ensure_ascii=False, indent=2))])
+            for key in ("device_name","manufacturer","model"):
+                if not result.get(key): result.pop(key,None)
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps(results[:MAX_SEARCH_RESULTS],ensure_ascii=False,indent=2))])
 
     if params.name == "get_entity_state":
-        entity_id = str(params.arguments.get("entity_id", "")).strip()
-        if not re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", entity_id): raise ValueError("invalid entity_id")
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(await ha_get(f"/api/states/{entity_id}"), ensure_ascii=False, indent=2))])
+        entity_id=str(args.get("entity_id","")).strip()
+        if not re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+",entity_id): raise ValueError("invalid entity_id")
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps(await ha_get(f"/api/states/{entity_id}"),ensure_ascii=False,indent=2))])
 
     if params.name == "list_services":
-        query = normalize(params.arguments.get("query", ""))
-        services = await list_ha_services()
+        query=normalize(args.get("query","")); services=await list_ha_services()
         if query:
-            terms = query.split()
-            services = [item for item in services if all(term in normalize(f"{item['service']} {item.get('name') or ''} {item.get('description') or ''}") for term in terms)]
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(services, ensure_ascii=False, indent=2))])
+            terms=query.split(); services=[s for s in services if all(t in normalize(f"{s['service']} {s.get('name') or ''} {s.get('description') or ''}") for t in terms)]
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps(services,ensure_ascii=False,indent=2))])
 
     if params.name == "call_service":
-        result = await ha_call_service(str(params.arguments.get("domain", "")).strip().lower(), str(params.arguments.get("service", "")).strip().lower(), params.arguments.get("service_data", {}))
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"success": True, "result": result}, ensure_ascii=False, indent=2))])
+        result=await ha_call_service(str(args.get("domain","")).strip().lower(),str(args.get("service","")).strip().lower(),args.get("service_data",{}))
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps({"success":True,"result":result},ensure_ascii=False,indent=2))])
 
     if params.name == "configuration_status":
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"enabled": ALLOW_CONFIGURATION, "allowed_files": sorted(ALLOWED_CONFIG_FILES), "config_root": str(CONFIG_ROOT)}, indent=2))])
-    if params.name == "read_config": return CallToolResult(content=[TextContent(type="text", text=read_config_file(params.arguments.get("filename", "")))])
-    if params.name == "update_config": return CallToolResult(content=[TextContent(type="text", text=json.dumps(update_config_file(params.arguments.get("filename", ""), params.arguments.get("content", "")), indent=2))])
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps({"enabled":ALLOW_CONFIGURATION,"allowed_files":sorted(ALLOWED_CONFIG_FILES),"dashboard_management":ALLOW_CONFIGURATION},indent=2))])
+
+    if params.name == "read_config": return CallToolResult(content=[TextContent(type="text",text=read_config_file(args.get("filename","")))])
+    if params.name == "update_config": return CallToolResult(content=[TextContent(type="text",text=json.dumps(update_config_file(args.get("filename",""),args.get("content","")),indent=2))])
+
+    if params.name in {"list_dashboards","read_dashboard","create_dashboard","update_dashboard"} and not ALLOW_CONFIGURATION:
+        raise PermissionError("Dashboard management is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
+    if params.name == "list_dashboards":
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps(await list_dashboards(),ensure_ascii=False,indent=2))])
+    if params.name == "read_dashboard":
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps(await get_dashboard(args.get("url_path")),ensure_ascii=False,indent=2))])
+    if params.name == "create_dashboard":
+        result=await create_dashboard(str(args["url_path"]).strip(),str(args["title"]).strip(),str(args.get("icon") or "mdi:view-dashboard"),bool(args.get("show_in_sidebar",True)),bool(args.get("require_admin",False)))
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps({"success":True,"dashboard":result},ensure_ascii=False,indent=2))])
+    if params.name == "update_dashboard":
+        config=args.get("config")
+        if not isinstance(config,dict): raise ValueError("config must be an object")
+        if "views" not in config and "strategy" not in config: raise ValueError("Dashboard config must contain views or strategy")
+        result=await save_dashboard(str(args["url_path"]).strip(),config)
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps({"success":True,"result":result},ensure_ascii=False,indent=2))])
+
     raise ValueError(f"Unknown tool: {params.name}")
 
 
-server = Server("home-assistant-mcp", version="1.6.0", on_list_tools=list_tools, on_call_tool=call_tool)
-
+server=Server("home-assistant-mcp",version="1.7.0",on_list_tools=list_tools,on_call_tool=call_tool)
 
 async def main():
-    app = server.streamable_http_app(streamable_http_path="/mcp", host="0.0.0.0", stateless_http=True)
-    await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")).serve()
+    app=server.streamable_http_app(streamable_http_path="/mcp",host="0.0.0.0",stateless_http=True)
+    await uvicorn.Server(uvicorn.Config(app,host="0.0.0.0",port=8000,log_level="info")).serve()
 
-
-if __name__ == "__main__": asyncio.run(main())
+if __name__=="__main__": asyncio.run(main())

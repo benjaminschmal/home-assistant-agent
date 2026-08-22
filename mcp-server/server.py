@@ -107,17 +107,11 @@ def validate_yaml(text: str) -> None:
             pass
 
         def construct_home_assistant_tag(loader, tag_suffix, node):
-            if isinstance(node, ScalarNode):
-                return loader.construct_scalar(node)
-            if isinstance(node, SequenceNode):
-                return loader.construct_sequence(node)
-            if isinstance(node, MappingNode):
-                return loader.construct_mapping(node)
+            if isinstance(node, ScalarNode): return loader.construct_scalar(node)
+            if isinstance(node, SequenceNode): return loader.construct_sequence(node)
+            if isinstance(node, MappingNode): return loader.construct_mapping(node)
             return None
 
-        # Home Assistant extends YAML with tags such as !include, !secret,
-        # !env_var and !input. For validation we only need their YAML shape;
-        # they must not be resolved or executed.
         HomeAssistantLoader.add_multi_constructor("!", construct_home_assistant_tag)
         yaml.load(text, Loader=HomeAssistantLoader)
     except ImportError:
@@ -127,24 +121,19 @@ def validate_yaml(text: str) -> None:
 
 
 def read_config_file(filename: str) -> str:
-    if not ALLOW_CONFIGURATION:
-        raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
+    if not ALLOW_CONFIGURATION: raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
     path = config_file_path(filename)
-    if not path.exists():
-        raise FileNotFoundError(f"Configuration file '{filename}' does not exist")
+    if not path.exists(): raise FileNotFoundError(f"Configuration file '{filename}' does not exist")
     return path.read_text(encoding="utf-8")
 
 
 def update_config_file(filename: str, content: str) -> dict[str, Any]:
-    if not ALLOW_CONFIGURATION:
-        raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("content must be a non-empty string")
+    if not ALLOW_CONFIGURATION: raise PermissionError("Configuration editing is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
+    if not isinstance(content, str) or not content.strip(): raise ValueError("content must be a non-empty string")
     path = config_file_path(filename)
     validate_yaml(content)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.replace(backup_path(path))
+    if path.exists(): path.replace(backup_path(path))
     path.write_text(content, encoding="utf-8")
     return {"success": True, "file": filename, "backup": str(backup_path(path).name), "validated": True}
 
@@ -153,19 +142,29 @@ async def ha_ws_command(command_type: str) -> Any:
     ws_url = HA_URL.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + "/api/websocket"
     async with websockets.connect(ws_url, open_timeout=HA_TIMEOUT, close_timeout=HA_TIMEOUT) as websocket:
         hello = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
-        if hello.get("type") != "auth_required":
-            raise RuntimeError("Unexpected Home Assistant WebSocket handshake")
+        if hello.get("type") != "auth_required": raise RuntimeError("Unexpected Home Assistant WebSocket handshake")
         await websocket.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
         auth = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
-        if auth.get("type") != "auth_ok":
-            raise RuntimeError("Home Assistant WebSocket authentication failed")
+        if auth.get("type") != "auth_ok": raise RuntimeError("Home Assistant WebSocket authentication failed")
         await websocket.send(json.dumps({"id": 1, "type": command_type}))
         while True:
             message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=HA_TIMEOUT))
             if message.get("id") == 1:
-                if not message.get("success"):
-                    raise RuntimeError(f"Home Assistant WebSocket command failed: {command_type}")
+                if not message.get("success"): raise RuntimeError(f"Home Assistant WebSocket command failed: {command_type}")
                 return message.get("result")
+
+
+async def list_ha_services() -> list[dict[str, Any]]:
+    result = await ha_ws_command("get_services")
+    services = []
+    for domain, domain_services in (result or {}).items():
+        for service, definition in (domain_services or {}).items():
+            services.append({
+                "service": f"{domain}.{service}",
+                "name": definition.get("name") if isinstance(definition, dict) else None,
+                "description": definition.get("description") if isinstance(definition, dict) else None,
+            })
+    return sorted(services, key=lambda item: item["service"])
 
 
 def normalize(value: Any) -> str:
@@ -176,8 +175,7 @@ def normalize(value: Any) -> str:
 
 def search_score(query: str, entity: dict[str, Any], registry_text: str = "") -> int:
     terms = normalize(query).split()
-    if not terms:
-        return 0
+    if not terms: return 0
     searchable = {k: normalize(entity.get(k, "")) for k in ("friendly_name", "entity_id", "device_class", "state", "domain")}
     searchable["registry"] = normalize(registry_text)
     score = 0
@@ -193,8 +191,7 @@ def search_score(query: str, entity: dict[str, Any], registry_text: str = "") ->
 
 def registry_text(entry: dict[str, Any], device: dict[str, Any] | None) -> str:
     values = [entry.get("name"), entry.get("original_name"), entry.get("platform")]
-    if device:
-        values += [device.get("name"), device.get("name_by_user"), device.get("manufacturer"), device.get("model"), device.get("model_id")]
+    if device: values += [device.get("name"), device.get("name_by_user"), device.get("manufacturer"), device.get("model"), device.get("model_id")]
     return " ".join(str(v) for v in values if v)
 
 
@@ -209,14 +206,7 @@ async def build_entity_index() -> list[dict[str, Any]]:
         attrs = state.get("attributes", {}) or {}
         entry = by_entity.get(entity_id, {})
         device = by_device.get(entry.get("device_id"))
-        indexed.append({
-            "entity_id": entity_id, "friendly_name": attrs.get("friendly_name", ""), "state": state.get("state"),
-            "unit_of_measurement": attrs.get("unit_of_measurement"), "device_class": attrs.get("device_class"),
-            "domain": entity_id.split(".", 1)[0] if "." in entity_id else "",
-            "device_name": (device or {}).get("name_by_user") or (device or {}).get("name"),
-            "manufacturer": (device or {}).get("manufacturer"), "model": (device or {}).get("model"),
-            "registry_text": registry_text(entry, device),
-        })
+        indexed.append({"entity_id": entity_id, "friendly_name": attrs.get("friendly_name", ""), "state": state.get("state"), "unit_of_measurement": attrs.get("unit_of_measurement"), "device_class": attrs.get("device_class"), "domain": entity_id.split(".", 1)[0] if "." in entity_id else "", "device_name": (device or {}).get("name_by_user") or (device or {}).get("name"), "manufacturer": (device or {}).get("manufacturer"), "model": (device or {}).get("model"), "registry_text": registry_text(entry, device)})
     return indexed
 
 
@@ -224,6 +214,7 @@ async def list_tools(context, params) -> ListToolsResult:
     tools = [
         Tool(name="search_entities", description="Search Home Assistant entities. Empty query lists available entities.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}}),
         Tool(name="get_entity_state", description="Get the current state and attributes of one Home Assistant entity.", inputSchema={"type": "object", "properties": {"entity_id": {"type": "string"}}, "required": ["entity_id"]}),
+        Tool(name="list_services", description="List services currently registered by Home Assistant. Use this to discover available actions before attempting a service call.", inputSchema={"type": "object", "properties": {"query": {"type": "string", "description": "Optional filter such as printer, print, light or climate."}}}),
         Tool(name="call_service", description="Call an allowed Home Assistant service to control a device or entity.", inputSchema={"type": "object", "properties": {"domain": {"type": "string"}, "service": {"type": "string"}, "service_data": {"type": "object"}}, "required": ["domain", "service", "service_data"]}),
         Tool(name="configuration_status", description="Show whether configuration editing is enabled and which YAML files are allowed.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="read_config", description="Read an allowed Home Assistant YAML configuration file. Requires configuration editing to be enabled.", inputSchema={"type": "object", "properties": {"filename": {"type": "string", "enum": sorted(ALLOWED_CONFIG_FILES)}}, "required": ["filename"]}),
@@ -244,8 +235,7 @@ async def call_tool(context, params) -> CallToolResult:
                     entity["_score"] = score
                     results.append(entity)
             results.sort(key=lambda x: (-x.pop("_score"), x["entity_id"]))
-        else:
-            results = entities
+        else: results = entities
         for result in results:
             result.pop("registry_text", None)
             for key in ("device_name", "manufacturer", "model"):
@@ -257,24 +247,26 @@ async def call_tool(context, params) -> CallToolResult:
         if not re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", entity_id): raise ValueError("invalid entity_id")
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(await ha_get(f"/api/states/{entity_id}"), ensure_ascii=False, indent=2))])
 
+    if params.name == "list_services":
+        query = normalize(params.arguments.get("query", ""))
+        services = await list_ha_services()
+        if query:
+            terms = query.split()
+            services = [item for item in services if all(term in normalize(f"{item['service']} {item.get('name') or ''} {item.get('description') or ''}") for term in terms)]
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(services, ensure_ascii=False, indent=2))])
+
     if params.name == "call_service":
         result = await ha_call_service(str(params.arguments.get("domain", "")).strip().lower(), str(params.arguments.get("service", "")).strip().lower(), params.arguments.get("service_data", {}))
         return CallToolResult(content=[TextContent(type="text", text=json.dumps({"success": True, "result": result}, ensure_ascii=False, indent=2))])
 
     if params.name == "configuration_status":
         return CallToolResult(content=[TextContent(type="text", text=json.dumps({"enabled": ALLOW_CONFIGURATION, "allowed_files": sorted(ALLOWED_CONFIG_FILES), "config_root": str(CONFIG_ROOT)}, indent=2))])
-
-    if params.name == "read_config":
-        return CallToolResult(content=[TextContent(type="text", text=read_config_file(params.arguments.get("filename", "")))])
-
-    if params.name == "update_config":
-        result = update_config_file(params.arguments.get("filename", ""), params.arguments.get("content", ""))
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
-
+    if params.name == "read_config": return CallToolResult(content=[TextContent(type="text", text=read_config_file(params.arguments.get("filename", "")))])
+    if params.name == "update_config": return CallToolResult(content=[TextContent(type="text", text=json.dumps(update_config_file(params.arguments.get("filename", ""), params.arguments.get("content", "")), indent=2))])
     raise ValueError(f"Unknown tool: {params.name}")
 
 
-server = Server("home-assistant-mcp", version="1.5.0", on_list_tools=list_tools, on_call_tool=call_tool)
+server = Server("home-assistant-mcp", version="1.6.0", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 async def main():
@@ -282,5 +274,4 @@ async def main():
     await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")).serve()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == "__main__": asyncio.run(main())

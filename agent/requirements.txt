@@ -1,4 +1,5 @@
 openai
+anthropic
 mcp>=2,<3
 python-dotenv
 fastapi

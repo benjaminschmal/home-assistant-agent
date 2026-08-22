@@ -193,6 +193,13 @@ async def create_dashboard(url_path: str, title: str, icon: str = "mdi:view-dash
     return await ha_ws_command("lovelace/dashboards/create", payload)
 
 
+async def delete_dashboard(dashboard_id: str) -> Any:
+    dashboard_id = str(dashboard_id or "").strip()
+    if not dashboard_id:
+        raise ValueError("dashboard_id is required")
+    return await ha_ws_command("lovelace/dashboards/delete", {"dashboard_id": dashboard_id})
+
+
 def normalize(value: Any) -> str:
     value = "" if value is None else str(value)
     value = value.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
@@ -245,10 +252,11 @@ async def list_tools(context, params) -> ListToolsResult:
         Tool(name="configuration_status", description="Show whether configuration editing is enabled and which YAML files are allowed.", inputSchema={"type":"object","properties":{}}),
         Tool(name="read_config", description="Read an allowed Home Assistant YAML configuration file. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"filename":{"type":"string","enum":sorted(ALLOWED_CONFIG_FILES)}},"required":["filename"]}),
         Tool(name="update_config", description="Replace an allowed Home Assistant YAML configuration file. The new YAML is validated and the existing file is backed up before writing. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"filename":{"type":"string","enum":sorted(ALLOWED_CONFIG_FILES)},"content":{"type":"string"}},"required":["filename","content"]}),
-        Tool(name="list_dashboards", description="List Home Assistant Lovelace dashboards. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{}}),
+        Tool(name="list_dashboards", description="List Home Assistant Lovelace dashboards. Use this before creating or deleting a dashboard. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{}}),
         Tool(name="read_dashboard", description="Read the current Lovelace dashboard configuration. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"url_path":{"type":"string","description":"Dashboard URL path. Omit for the default Overview dashboard."}}}),
         Tool(name="create_dashboard", description="Create a storage-mode Lovelace dashboard. Requires configuration editing to be enabled. The URL path must contain a hyphen.", inputSchema={"type":"object","properties":{"url_path":{"type":"string"},"title":{"type":"string"},"icon":{"type":"string"},"show_in_sidebar":{"type":"boolean"},"require_admin":{"type":"boolean"}},"required":["url_path","title"]}),
         Tool(name="update_dashboard", description="Save a complete storage-mode Lovelace dashboard configuration. Read the dashboard first, preserve unrelated content, then make the smallest requested change. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"url_path":{"type":"string"},"config":{"type":"object"}},"required":["url_path","config"]}),
+        Tool(name="delete_dashboard", description="Delete a storage-mode Lovelace dashboard. This is destructive. Always call list_dashboards first, identify the exact dashboard_id, and only then delete it when the user explicitly requested deletion. Requires configuration editing to be enabled.", inputSchema={"type":"object","properties":{"dashboard_id":{"type":"string"}},"required":["dashboard_id"]}),
     ]
     return ListToolsResult(tools=tools)
 
@@ -290,7 +298,8 @@ async def call_tool(context, params) -> CallToolResult:
     if params.name == "read_config": return CallToolResult(content=[TextContent(type="text",text=read_config_file(args.get("filename","")))])
     if params.name == "update_config": return CallToolResult(content=[TextContent(type="text",text=json.dumps(update_config_file(args.get("filename",""),args.get("content","")),indent=2))])
 
-    if params.name in {"list_dashboards","read_dashboard","create_dashboard","update_dashboard"} and not ALLOW_CONFIGURATION:
+    dashboard_tools={"list_dashboards","read_dashboard","create_dashboard","update_dashboard","delete_dashboard"}
+    if params.name in dashboard_tools and not ALLOW_CONFIGURATION:
         raise PermissionError("Dashboard management is disabled. Enable MCP_ALLOW_CONFIGURATION=true")
     if params.name == "list_dashboards":
         return CallToolResult(content=[TextContent(type="text",text=json.dumps(await list_dashboards(),ensure_ascii=False,indent=2))])
@@ -305,11 +314,14 @@ async def call_tool(context, params) -> CallToolResult:
         if "views" not in config and "strategy" not in config: raise ValueError("Dashboard config must contain views or strategy")
         result=await save_dashboard(str(args["url_path"]).strip(),config)
         return CallToolResult(content=[TextContent(type="text",text=json.dumps({"success":True,"result":result},ensure_ascii=False,indent=2))])
+    if params.name == "delete_dashboard":
+        result=await delete_dashboard(str(args["dashboard_id"]).strip())
+        return CallToolResult(content=[TextContent(type="text",text=json.dumps({"success":True,"result":result,"dashboard_id":str(args["dashboard_id"]).strip()},ensure_ascii=False,indent=2))])
 
     raise ValueError(f"Unknown tool: {params.name}")
 
 
-server=Server("home-assistant-mcp",version="1.7.0",on_list_tools=list_tools,on_call_tool=call_tool)
+server=Server("home-assistant-mcp",version="1.8.0",on_list_tools=list_tools,on_call_tool=call_tool)
 
 async def main():
     app=server.streamable_http_app(streamable_http_path="/mcp",host="0.0.0.0",stateless_http=True)

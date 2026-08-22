@@ -15,13 +15,9 @@ from openai import OpenAIError
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-
 load_dotenv()
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("home-assistant-agent")
 
 MCP_URL = os.environ.get("MCP_URL", "").strip()
@@ -57,6 +53,9 @@ HTML = """
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; margin: 0; padding: 0; }
 .container { max-width: 900px; margin: 40px auto; background: white; border-radius: 14px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
 h1 { margin-top: 0; }
+.controls { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
+select { padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 15px; background: white; }
+.status { font-size: 13px; color: #666; }
 #chat { min-height: 350px; max-height: 600px; overflow-y: auto; border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
 .message { margin: 12px 0; padding: 12px 14px; border-radius: 10px; white-space: pre-wrap; }
 .user { background: #e8f0fe; }
@@ -70,6 +69,11 @@ button:disabled { opacity: 0.5; }
 <body>
 <div class="container">
 <h1>Home Assistant AI</h1>
+<div class="controls">
+<label for="model">KI-Modell:</label>
+<select id="model"></select>
+<span id="modelStatus" class="status"></span>
+</div>
 <div id="chat"></div>
 <div class="input-row">
 <input id="message" type="text" placeholder="z.B. Wie warm ist der Vorlauf?" autocomplete="off" />
@@ -80,6 +84,9 @@ button:disabled { opacity: 0.5; }
 const input = document.getElementById("message");
 const button = document.getElementById("send");
 const chat = document.getElementById("chat");
+const modelSelect = document.getElementById("model");
+const modelStatus = document.getElementById("modelStatus");
+let models = [];
 function addMessage(text, type) {
     const div = document.createElement("div");
     div.className = "message " + type;
@@ -87,15 +94,39 @@ function addMessage(text, type) {
     chat.appendChild(div);
     chat.scrollTop = chat.scrollHeight;
 }
+async function loadModels() {
+    try {
+        const response = await fetch("/models");
+        const data = await response.json();
+        models = data.models || [];
+        modelSelect.innerHTML = "";
+        for (const model of models) {
+            const option = document.createElement("option");
+            option.value = model.id;
+            option.textContent = model.name + (model.available ? "" : " (nicht verfügbar)");
+            option.disabled = !model.available;
+            modelSelect.appendChild(option);
+        }
+        if (data.default_model) modelSelect.value = data.default_model;
+        modelStatus.textContent = data.provider || "";
+    } catch (error) {
+        modelStatus.textContent = "Modellliste nicht verfügbar";
+    }
+}
 async function sendMessage() {
     const message = input.value.trim();
     if (!message) return;
     addMessage(message, "user");
     input.value = "";
     button.disabled = true;
+    modelSelect.disabled = true;
     addMessage("Denke nach ...", "assistant");
     try {
-        const response = await fetch("/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: message }) });
+        const response = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: message, model: modelSelect.value })
+        });
         const data = await response.json();
         chat.lastChild.remove();
         if (!response.ok || data.error) addMessage("Fehler: " + (data.error || "Unbekannter Fehler"), "assistant");
@@ -105,16 +136,24 @@ async function sendMessage() {
         addMessage("Verbindungsfehler: " + error, "assistant");
     } finally {
         button.disabled = false;
+        modelSelect.disabled = false;
         input.focus();
     }
 }
 button.addEventListener("click", sendMessage);
 input.addEventListener("keydown", event => { if (event.key === "Enter") sendMessage(); });
 input.focus();
+loadModels();
 </script>
 </body>
 </html>
 """
+
+
+MODEL_OPTIONS = [
+    {"id": "openai", "name": f"GPT ({OPENAI_MODEL})", "provider": "OpenAI", "available": True},
+    {"id": "ollama", "name": "Ollama (lokal)", "provider": "Ollama", "available": False},
+]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -122,9 +161,20 @@ async def index():
     return HTML
 
 
+@app.get("/models")
+async def models_endpoint():
+    return {"default_model": "openai", "provider": "OpenAI aktiv", "models": MODEL_OPTIONS}
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "home-assistant-agent", "model": OPENAI_MODEL, "mcp_configured": bool(MCP_URL)}
+    return {
+        "status": "ok",
+        "service": "home-assistant-agent",
+        "model": OPENAI_MODEL,
+        "provider": "openai",
+        "mcp_configured": bool(MCP_URL),
+    }
 
 
 async def run_with_timeout(awaitable, timeout: float, operation: str):
@@ -140,86 +190,85 @@ async def load_mcp_tools(session: ClientSession):
     return result.tools
 
 
+async def run_openai_agent(session: ClientSession, tools, user_message: str):
+    openai_tools = []
+    tool_names = set()
+    for tool in tools:
+        tool_names.add(tool.name)
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "Home Assistant tool",
+                "parameters": tool.input_schema,
+            },
+        })
+    if not openai_tools:
+        raise RuntimeError("MCP server returned no tools")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a Home Assistant AI assistant. Use the available Home Assistant tools to answer questions. "
+                "For unknown devices or sensors, search_entities first. Never invent entity IDs, values or states. "
+                "Use get_entity_state when current state is required. Use call_service only for actions allowed by the MCP server. "
+                "Configuration editing is a separate privileged capability. If the user asks to read or change YAML, first call configuration_status. "
+                "If configuration editing is disabled, explain that it must be enabled. If enabled and the user explicitly asks to change an allowed YAML file, "
+                "read the current file first, make the smallest necessary change, preserve all unrelated content, and then call update_config with the complete new file. "
+                "Do not claim a configuration change was made unless update_config returns success. Never replace a configuration file with a guessed or unrelated example. "
+                "For a requested configuration change, explain what will be changed before performing it when the change is consequential. "
+                "For a harmless test such as adding a comment, it is acceptable to execute directly when explicitly requested. "
+                "When several entities match, use the most relevant match and state which entity was used."
+            ),
+        },
+        {"role": "user", "content": user_message},
+    ]
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = await run_with_timeout(
+            client.chat.completions.create(model=OPENAI_MODEL, messages=messages, tools=openai_tools, tool_choice="auto"),
+            OPENAI_TIMEOUT,
+            "OpenAI request",
+        )
+        message = response.choices[0].message
+        if not message.tool_calls:
+            return message.content or ""
+        messages.append(message.model_dump(exclude_none=True))
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            if tool_name not in tool_names:
+                raise RuntimeError(f"Model requested unknown MCP tool: {tool_name}")
+            try:
+                arguments = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid arguments for MCP tool {tool_name}") from exc
+            logger.info("Calling MCP tool: %s", tool_name)
+            result = await run_with_timeout(session.call_tool(tool_name, arguments), MCP_TIMEOUT, f"MCP tool {tool_name}")
+            tool_text = ""
+            for content in result.content:
+                if hasattr(content, "text") and content.text:
+                    tool_text += content.text
+            if getattr(result, "is_error", False):
+                tool_text = f"MCP tool error: {tool_text or 'unknown error'}"
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_text or "No data returned."})
+    raise RuntimeError("Maximum tool-call rounds exceeded")
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     logger.info("Processing chat request")
     try:
+        # Model selection is intentionally prepared for future providers.
+        # Currently only OpenAI is enabled; Ollama is advertised as unavailable.
+        requested_model = getattr(request, "model", "openai")
+        if requested_model != "openai":
+            raise ValueError("Selected model provider is not available yet")
         async with streamable_http_client(MCP_URL) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 tools = await load_mcp_tools(session)
-                openai_tools = []
-                tool_names = set()
-                for tool in tools:
-                    tool_names.add(tool.name)
-                    openai_tools.append({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description or "Home Assistant tool",
-                            "parameters": tool.input_schema,
-                        },
-                    })
-                if not openai_tools:
-                    raise RuntimeError("MCP server returned no tools")
-
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a Home Assistant AI assistant. Use the available Home Assistant tools to answer questions. "
-                            "For unknown devices or sensors, search_entities first. Never invent entity IDs, values or states. "
-                            "Use get_entity_state when current state is required. "
-                            "Use call_service only for actions allowed by the MCP server. "
-                            "Configuration editing is a separate privileged capability. If the user asks to read or change YAML, "
-                            "first call configuration_status. If configuration editing is disabled, explain that it must be enabled. "
-                            "If enabled and the user explicitly asks to change an allowed YAML file, read the current file first, "
-                            "make the smallest necessary change, preserve all unrelated content, and then call update_config with the complete new file. "
-                            "Do not claim a configuration change was made unless update_config returns success. "
-                            "Never replace a configuration file with a guessed or unrelated example. "
-                            "For a requested configuration change, explain what will be changed before performing it when the change is consequential. "
-                            "For a harmless test such as adding a comment, it is acceptable to execute directly when explicitly requested. "
-                            "When several entities match, use the most relevant match and state which entity was used. "
-                            "When a device has related entities, report relevant related states only when the tool results identify the same device."
-                        ),
-                    },
-                    {"role": "user", "content": request.message},
-                ]
-
-                for _ in range(MAX_TOOL_ROUNDS):
-                    response = await run_with_timeout(
-                        client.chat.completions.create(
-                            model=OPENAI_MODEL,
-                            messages=messages,
-                            tools=openai_tools,
-                            tool_choice="auto",
-                        ),
-                        OPENAI_TIMEOUT,
-                        "OpenAI request",
-                    )
-                    message = response.choices[0].message
-                    if not message.tool_calls:
-                        return {"response": message.content or ""}
-                    messages.append(message.model_dump(exclude_none=True))
-
-                    for tool_call in message.tool_calls:
-                        tool_name = tool_call.function.name
-                        if tool_name not in tool_names:
-                            raise RuntimeError(f"Model requested unknown MCP tool: {tool_name}")
-                        try:
-                            arguments = json.loads(tool_call.function.arguments or "{}")
-                        except json.JSONDecodeError as exc:
-                            raise RuntimeError(f"Invalid arguments for MCP tool {tool_name}") from exc
-                        logger.info("Calling MCP tool: %s", tool_name)
-                        result = await run_with_timeout(session.call_tool(tool_name, arguments), MCP_TIMEOUT, f"MCP tool {tool_name}")
-                        tool_text = ""
-                        for content in result.content:
-                            if hasattr(content, "text") and content.text:
-                                tool_text += content.text
-                        if getattr(result, "is_error", False):
-                            tool_text = f"MCP tool error: {tool_text or 'unknown error'}"
-                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_text or "No data returned."})
-                raise RuntimeError("Maximum tool-call rounds exceeded")
-
+                response_text = await run_openai_agent(session, tools, request.message)
+                return {"response": response_text, "model": OPENAI_MODEL, "provider": "openai"}
     except OpenAIError as exc:
         logger.exception("OpenAI request failed")
         return {"error": f"OpenAI error: {exc}"}

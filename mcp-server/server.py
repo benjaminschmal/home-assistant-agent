@@ -51,6 +51,13 @@ async def ha_get(path: str) -> Any:
         raise RuntimeError("Home Assistant request failed") from exc
 
 
+async def ha_get_optional(path: str) -> Any | None:
+    try:
+        return await ha_get(path)
+    except RuntimeError:
+        return None
+
+
 async def ha_post(path: str, payload: dict[str, Any]) -> Any:
     try:
         async with httpx.AsyncClient(timeout=HA_TIMEOUT) as client:
@@ -75,6 +82,40 @@ async def ha_delete(path: str) -> Any:
         response = await client.delete(f"{HA_URL}{path}", headers=auth_headers())
         response.raise_for_status()
         return response.json() if response.content else {"success": True}
+
+
+async def get_home_assistant_info() -> dict[str, Any]:
+    """Detect the connected Home Assistant Core version and exposed platform capabilities.
+
+    The public Core API reliably exposes the Core version and loaded components. The
+    presence of the hassio integration is used as a capability signal for Supervisor
+    features. We deliberately do not claim an exact host type when Core cannot prove it.
+    """
+    config = await ha_get("/api/config")
+    components = {str(component).lower() for component in (config.get("components") or [])}
+    supervisor_available = "hassio" in components
+    return {
+        "home_assistant_version": config.get("version"),
+        "location_name": config.get("location_name"),
+        "time_zone": config.get("time_zone"),
+        "supervisor_available": supervisor_available,
+        "addon_store_available": supervisor_available,
+        "installation_family": "supervised_or_home_assistant_os" if supervisor_available else "core_without_supervisor",
+        "capabilities": {
+            "core_api": True,
+            "configuration_yaml": True,
+            "lovelace_dashboards": True,
+            "energy_dashboard": True,
+            "integration_config_flows": True,
+            "supervisor": supervisor_available,
+            "addons": supervisor_available,
+        },
+        "detection_notes": [
+            "The Core API exposes the Home Assistant Core version and loaded components.",
+            "Exact host/container type is not asserted unless the connected Home Assistant exposes a reliable signal.",
+            "If supervisor_available is false, do not recommend Home Assistant Add-ons or the Add-on Store.",
+        ],
+    }
 
 
 async def ha_call_service(domain: str, service: str, service_data: dict[str, Any]) -> Any:
@@ -324,6 +365,7 @@ def text_result(value: Any) -> CallToolResult:
 
 async def list_tools(context, params) -> ListToolsResult:
     tools = [
+        Tool(name="get_home_assistant_info", description="Detect the connected Home Assistant Core version and available platform capabilities. Use before platform-dependent advice such as Add-ons, Supervisor, MQTT installation, configuration, updates or backups. Do not assume Home Assistant OS.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="search_entities", description="Search Home Assistant entities. Empty query lists available entities.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}}),
         Tool(name="get_entity_state", description="Get the current state and attributes of one Home Assistant entity.", inputSchema={"type": "object", "properties": {"entity_id": {"type": "string"}}, "required": ["entity_id"]}),
         Tool(name="list_services", description="List services currently registered by Home Assistant.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}}),
@@ -351,6 +393,8 @@ async def list_tools(context, params) -> ListToolsResult:
 
 async def call_tool(context, params) -> CallToolResult:
     args = params.arguments or {}
+    if params.name == "get_home_assistant_info":
+        return text_result(await get_home_assistant_info())
     if params.name == "search_entities":
         query = str(args.get("query", "")).strip()
         entities = await build_entity_index()
@@ -471,7 +515,7 @@ async def call_tool(context, params) -> CallToolResult:
     raise ValueError(f"Unknown tool: {params.name}")
 
 
-server = Server("home-assistant-mcp", version="1.10.0", on_list_tools=list_tools, on_call_tool=call_tool)
+server = Server("home-assistant-mcp", version="1.11.0", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 async def main():

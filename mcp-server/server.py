@@ -147,89 +147,139 @@ async def save_energy_preferences(prefs: dict[str, Any]) -> Any:
     return await ha_ws_command("energy/save_prefs", {k: prefs[k] for k in required})
 
 async def get_hacs_info() -> dict[str, Any]:
-    """Inspect HACS directly through its websocket API and report installed repositories and update state."""
+    """Return HACS status and only locally installed repositories.
+
+    Avoid the HACS websocket repository-list command because it can return the
+    complete HACS catalog and exceed the MCP/WebSocket 1 MiB frame limit.
+    The local HACS storage is authoritative for the installed repository set.
+    """
     hacs_dir = CONFIG_ROOT / "custom_components" / "hacs"
     manifest_path = hacs_dir / "manifest.json"
     if not (hacs_dir.is_dir() and manifest_path.is_file()):
-        return {"installed": False, "version": None, "latest_version": None, "update_available": False, "managed_repository_count": 0, "installed_repository_count": 0, "installed_repositories": [], "message": "HACS is not installed."}
-    try: version = json.loads(manifest_path.read_text(encoding="utf-8")).get("version")
-    except (OSError, ValueError): version = None
+        return {
+            "installed": False,
+            "version": None,
+            "latest_version": None,
+            "update_available": False,
+            "installed_repository_count": 0,
+            "installed_repositories": [],
+            "message": "HACS is not installed in the connected Home Assistant instance.",
+        }
+
+    try:
+        version = json.loads(manifest_path.read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError):
+        version = None
 
     def version_key(value: Any) -> tuple:
-        return tuple((0, int(match.group(1))) if (match := re.match(r"(\d+)", part)) else (1, part.casefold()) for part in re.split(r"[.+\-_]", str(value or "").lstrip("vV")))
+        parts = re.split(r"[.+\-_]", str(value or "").lstrip("vV"))
+        return tuple(
+            (0, int(match.group(1))) if (match := re.match(r"(\d+)", part)) else (1, part.casefold())
+            for part in parts
+        )
 
     latest_version = None
     try:
         async with httpx.AsyncClient(timeout=HA_TIMEOUT, follow_redirects=True) as client:
-            response = await client.get("https://api.github.com/repos/hacs/integration/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "home-assistant-mcp"})
+            response = await client.get(
+                "https://api.github.com/repos/hacs/integration/releases/latest",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "home-assistant-mcp",
+                },
+            )
             response.raise_for_status()
             latest_version = str(response.json().get("tag_name") or "") or None
     except (httpx.HTTPError, ValueError):
         pass
 
-    managed = []
-    installed = []
-    source = "hacs_websocket"
+    repositories_path = CONFIG_ROOT / ".storage" / "hacs.repositories"
+    installed: list[dict[str, Any]] = []
+    source = "hacs_storage"
     storage_error = None
+
     try:
-        repositories = await ha_ws_command("hacs/repositories/list") or []
-        for repo in repositories:
-            if not isinstance(repo, dict) or not repo.get("full_name"):
+        raw = json.loads(repositories_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raw = None
+        storage_error = str(exc)
+
+    def repository_records(value: Any):
+        """Recursively find repository records without assuming HACS storage shape."""
+        if isinstance(value, dict):
+            if value.get("full_name"):
+                yield value
+            for child in value.values():
+                yield from repository_records(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from repository_records(child)
+
+    seen: set[str] = set()
+    if raw is not None:
+        for repo in repository_records(raw):
+            full_name = str(repo.get("full_name") or "")
+            if not full_name or full_name.casefold() == "hacs/integration" or full_name in seen:
                 continue
-            full_name = str(repo.get("full_name"))
-            # HACS itself is the manager, not an installed HACS repository for the user.
-            if full_name.casefold() == "hacs/integration":
-                continue
+
+            category = repo.get("category")
+            domain = repo.get("domain")
+            local_path = repo.get("local_path")
             installed_flag = bool(repo.get("installed"))
+
+            # HACS storage versions differ. If the explicit installed flag is
+            # absent, verify the local installation on disk.
+            if not installed_flag:
+                if category == "integration" and domain:
+                    installed_flag = (CONFIG_ROOT / "custom_components" / str(domain)).is_dir()
+                elif local_path:
+                    try:
+                        installed_flag = Path(str(local_path)).expanduser().exists()
+                    except OSError:
+                        installed_flag = False
+
+            if not installed_flag:
+                continue
+
             installed_version = repo.get("installed_version")
-            available_version = repo.get("available_version")
+            available_version = repo.get("available_version") or repo.get("version")
             pending_upgrade = bool(repo.get("pending_upgrade"))
-            version_update = bool(installed_version and available_version and version_key(available_version) > version_key(installed_version))
-            update_available = pending_upgrade or version_update
-            entry = {
+            update_available = pending_upgrade or bool(
+                installed_version and available_version and
+                version_key(available_version) > version_key(installed_version)
+            )
+
+            installed.append({
                 "full_name": full_name,
                 "name": repo.get("name"),
-                "category": repo.get("category"),
-                "domain": repo.get("domain"),
+                "category": category,
+                "domain": domain,
                 "description": repo.get("description"),
-                "installed": installed_flag,
+                "installed": True,
                 "installed_version": installed_version,
                 "available_version": available_version,
                 "update_available": update_available,
                 "status": repo.get("status"),
                 "pending_upgrade": pending_upgrade,
-                "local_path": repo.get("local_path"),
-            }
-            managed.append(entry)
-            if installed_flag:
-                installed.append(entry)
-    except RuntimeError as exc:
-        source = "storage_fallback"
-        storage_error = str(exc)
-        repositories_path = CONFIG_ROOT / ".storage" / "hacs.repositories"
-        try:
-            raw = json.loads(repositories_path.read_text(encoding="utf-8"))
-            data = raw.get("data", {}) if isinstance(raw, dict) else {}
-            items = data.values() if isinstance(data, dict) else []
-            for repo in items:
-                if not isinstance(repo, dict) or not repo.get("full_name"):
-                    continue
-                full_name = str(repo.get("full_name"))
-                if full_name.casefold() == "hacs/integration":
-                    continue
-                category = repo.get("category")
-                domain = repo.get("domain")
-                local = False
-                if category == "integration" and domain:
-                    local = (CONFIG_ROOT / "custom_components" / str(domain)).is_dir()
-                entry = {"full_name": full_name, "name": repo.get("name"), "category": category, "domain": domain, "description": repo.get("description"), "installed": local, "installed_version": None, "available_version": None, "update_available": None, "status": None, "pending_upgrade": None, "local_path": None}
-                managed.append(entry)
-                if local:
-                    installed.append(entry)
-        except (OSError, ValueError, TypeError) as fallback_exc:
-            storage_error = f"{storage_error}; fallback failed: {fallback_exc}"
+                "local_path": local_path,
+            })
+            seen.add(full_name)
 
-    return {"installed": True, "version": version, "latest_version": latest_version, "update_available": bool(version and latest_version and version_key(latest_version) > version_key(version)), "managed_repository_count": len(managed), "installed_repository_count": len(installed), "installed_repositories": installed, "managed_repositories": managed, "source": source, "storage_error": storage_error}
+    installed.sort(key=lambda item: str(item.get("name") or item.get("full_name") or "").casefold())
+
+    return {
+        "installed": True,
+        "version": version,
+        "latest_version": latest_version,
+        "update_available": bool(
+            version and latest_version and version_key(latest_version) > version_key(version)
+        ),
+        "installed_repository_count": len(installed),
+        "installed_repositories": installed,
+        "source": source,
+        "storage_error": storage_error,
+        "message": "HACS is installed. Only locally installed HACS repositories are returned.",
+    }
 
 async def list_config_entries() -> list[dict[str, Any]]: return await ha_get("/api/config/config_entries/entry")
 async def start_config_flow(handler: str, user_input: dict[str, Any] | None = None) -> dict[str, Any]: return await ha_post("/api/config/config_entries/flow", {"handler":handler, **({"data":user_input} if user_input is not None else {})})

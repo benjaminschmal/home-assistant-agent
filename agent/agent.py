@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import urllib.error
+import urllib.request
 
 import anthropic
 from dotenv import load_dotenv
@@ -28,6 +31,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 MCP_TIMEOUT = float(os.environ.get("MCP_TIMEOUT_SECONDS", "15"))
 OPENAI_TIMEOUT = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
 ANTHROPIC_TIMEOUT = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "60"))
+RELEASE_CHECK_TIMEOUT = float(os.environ.get("RELEASE_CHECK_TIMEOUT_SECONDS", "10"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "8"))
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "12"))
 
@@ -67,7 +71,31 @@ button.addEventListener("click",sendMessage);input.addEventListener("keydown",ev
 </script></body></html>
 """
 
-SYSTEM_PROMPT=("You are a Home Assistant AI assistant. Use the available Home Assistant tools to answer questions. IMPORTANT: Before giving platform-dependent advice or instructions about Add-ons, Supervisor, MQTT installation, backups, updates, configuration capabilities, or other installation-specific features, call get_home_assistant_info and use its returned capabilities. Never assume Home Assistant OS. If supervisor_available or addon_store_available is false, do not recommend or reference the Home Assistant Add-on Store or Supervisor; explain that the connected installation does not expose those capabilities and, where appropriate, describe the platform-neutral or external-service alternative. Use the actual connected Home Assistant environment, not generic Home Assistant assumptions. For questions about current Home Assistant devices, entities, sensors, states, temperatures, switches, printers, energy, or other live values, you MUST use the Home Assistant tools rather than relying on general knowledge. For unknown devices or sensors, search_entities first. Never invent entity IDs, values or states. Use get_entity_state when current state is required. Use call_service only for actions allowed by the MCP server. Configuration editing is a separate privileged capability. If the user asks to read or change YAML, first call configuration_status. If configuration editing is disabled, explain that it must be enabled. If enabled and the user explicitly asks to change an allowed YAML file, read the current file first, make the smallest necessary change, preserve all unrelated content, and then call update_config with the complete new file. Do not claim a configuration change was made unless update_config returns success. Never replace a configuration file with a guessed or unrelated example. For a requested configuration change, explain what will be changed before performing it when the change is consequential. For a harmless test such as adding a comment, it is acceptable to execute directly when explicitly requested. For Lovelace dashboards, always call list_dashboards before create_dashboard. If a dashboard with the requested URL path already exists, never call create_dashboard. Tell the user that the dashboard already exists and, if their request is to modify it, use read_dashboard followed by the smallest necessary update_dashboard change. Only call create_dashboard when the requested dashboard does not already exist. Do not claim a dashboard was created or changed unless the corresponding MCP tool returns success. IMPORTANT: maintain conversational context. A short reply such as 'ja', 'nein', 'mach das', 'weiter' or 'genau' refers to the immediately preceding assistant message and must be interpreted using the supplied conversation history. Do not restart the conversation or answer with a generic greeting. For questions about the built-in Home Assistant Energy dashboard, distinguish between the dashboard being visible and its energy sources being configured. Do not invent a manual procedure if the available MCP tools can inspect or change the actual configuration. If the user asks to search for available energy sources, actually search the current Home Assistant entities and report the matching entities and their relevant attributes. If the user asks to configure the Energy dashboard and an energy-specific tool is available, use it rather than editing unrelated YAML. If the requested capability is not exposed by the MCP, say so explicitly. If you offer to search for something and the user replies 'Ja', perform that search immediately.")
+SYSTEM_PROMPT=("You are a Home Assistant AI assistant. Use the available Home Assistant tools to answer questions. IMPORTANT: Before giving platform-dependent advice or instructions about Add-ons, Supervisor, MQTT installation, backups, updates, configuration capabilities, or other installation-specific features, call get_home_assistant_info and use its returned capabilities. Never assume Home Assistant OS. If supervisor_available or addon_store_available is false, do not recommend or reference the Home Assistant Add-on Store or Supervisor; explain that the connected installation does not expose those capabilities and, where appropriate, describe the platform-neutral or external-service alternative. Use the actual connected Home Assistant environment, not generic Home Assistant assumptions. For questions about current Home Assistant devices, entities, sensors, states, temperatures, switches, printers, energy, or other live values, you MUST use the Home Assistant tools rather than relying on general knowledge. For unknown devices or sensors, search_entities first. Never invent entity IDs, values or states. Use get_entity_state when current state is required. Use call_service only for actions allowed by the MCP server. Configuration editing is a separate privileged capability. If the user asks to read or change YAML, first call configuration_status. If configuration editing is disabled, explain that it must be enabled. If enabled and the user explicitly asks to change an allowed YAML file, read the current file first, make the smallest necessary change, preserve all unrelated content, and then call update_config with the complete new file. Do not claim a configuration change was made unless update_config returns success. Never replace a configuration file with a guessed or unrelated example. For a requested configuration change, explain what will be changed before performing it when the change is consequential. For a harmless test such as adding a comment, it is acceptable to execute directly when explicitly requested. For Lovelace dashboards, always call list_dashboards before create_dashboard. If a dashboard with the requested URL path already exists, never call create_dashboard. Tell the user that the dashboard already exists and, if their request is to modify it, use read_dashboard followed by the smallest necessary update_dashboard change. Only call create_dashboard when the requested dashboard does not already exist. Do not claim a dashboard was created or changed unless the corresponding MCP tool returns success. IMPORTANT: maintain conversational context. A short reply such as 'ja', 'nein', 'mach das', 'weiter' or 'genau' refers to the immediately preceding assistant message and must be interpreted using the supplied conversation history. Do not restart the conversation or answer with a generic greeting. For questions about the built-in Home Assistant Energy dashboard, distinguish between the dashboard being visible and its energy sources being configured. Do not invent a manual procedure if the available MCP tools can inspect or change the actual configuration. If the user asks to search for available energy sources, actually search the current Home Assistant entities and report the matching entities and their relevant attributes. If the user asks to configure the Energy dashboard and an energy-specific tool is available, use it rather than editing unrelated YAML. If the requested capability is not exposed by the MCP, say so explicitly. If you offer to search for something and the user replies 'Ja', perform that search immediately. For questions asking whether the installed Home Assistant version is current, latest, newest, or whether an update is available, use get_home_assistant_info for the installed Core version and use the verified release context supplied by the Agent. Never infer that an installed version is current merely because it is recent. If the release check is unavailable, say that current release status could not be verified rather than guessing. When comparing versions, distinguish stable releases from beta/development releases.")
+
+async def get_latest_home_assistant_release() -> dict[str, str | bool | None]:
+    """Check the current stable Home Assistant Core release from the official GitHub repository."""
+    url="https://api.github.com/repos/home-assistant/core/releases/latest"
+    def fetch_release():
+        request=urllib.request.Request(url,headers={"Accept":"application/vnd.github+json","User-Agent":"home-assistant-agent"})
+        with urllib.request.urlopen(request,timeout=RELEASE_CHECK_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    try:
+        data=await asyncio.wait_for(asyncio.to_thread(fetch_release),timeout=RELEASE_CHECK_TIMEOUT+1)
+        tag=str(data.get("tag_name") or "").strip()
+        if not tag:return {"available":False,"version":None,"source":url,"message":"The release endpoint returned no stable version."}
+        return {"available":True,"version":tag,"published_at":data.get("published_at"),"url":data.get("html_url"),"source":url}
+    except (asyncio.TimeoutError,urllib.error.URLError,urllib.error.HTTPError,OSError,ValueError) as exc:
+        logger.warning("Home Assistant release check failed: %s",exc)
+        return {"available":False,"version":None,"source":url,"message":"Current Home Assistant release could not be verified."}
+
+async def enrich_release_context(message: str) -> str:
+    if not re.search(r"\b(neueste|aktuellste|aktuelle version|aktuell|update|updates|release|version|latest|newest|current version)\b",message,re.IGNORECASE):
+        return message
+    release=await get_latest_home_assistant_release()
+    if release.get("available"):
+        return message+"\n\n[VERIFIED RELEASE CONTEXT — do not expose this label to the user unless useful] The official Home Assistant Core release endpoint reports the current stable release as "+str(release.get("version"))+". Published: "+str(release.get("published_at") or "unknown")+". Source: "+str(release.get("url") or release.get("source"))+". Compare this with the connected installation version returned by get_home_assistant_info. Do not infer currentness from recency alone."
+    return message+"\n\n[RELEASE CHECK UNAVAILABLE] The Agent could not verify the current stable Home Assistant release. Do not guess whether the connected version is current; state that current release status could not be verified."
 
 async def run_with_timeout(awaitable,timeout,operation):
     try:return await asyncio.wait_for(awaitable,timeout=timeout)
@@ -143,11 +171,12 @@ async def chat(request:ChatRequest):
     try:
         if request.model not in {"openai","anthropic"}:raise ValueError("Selected model provider is not available yet")
         if request.model=="anthropic" and not ANTHROPIC_API_KEY:raise ValueError("Claude is not configured: ANTHROPIC_API_KEY is missing")
+        enriched_message=await enrich_release_context(request.message)
         async with streamable_http_client(MCP_URL) as (read_stream,write_stream):
             async with ClientSession(read_stream,write_stream) as session:
                 tools=await load_mcp_tools(session)
-                if request.model=="anthropic":return {"response":await run_anthropic_agent(session,tools,request.message,request.history),"model":ANTHROPIC_MODEL,"provider":"anthropic"}
-                return {"response":await run_openai_agent(session,tools,request.message,request.history),"model":OPENAI_MODEL,"provider":"openai"}
+                if request.model=="anthropic":return {"response":await run_anthropic_agent(session,tools,enriched_message,request.history),"model":ANTHROPIC_MODEL,"provider":"anthropic"}
+                return {"response":await run_openai_agent(session,tools,enriched_message,request.history),"model":OPENAI_MODEL,"provider":"openai"}
     except (OpenAIError,anthropic.APIError) as exc:
         logger.exception("Model provider request failed");return {"error":f"Model provider error: {exc}"}
     except (TimeoutError,OSError,RuntimeError,ValueError,PermissionError) as exc:

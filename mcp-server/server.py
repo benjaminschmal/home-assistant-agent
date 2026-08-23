@@ -246,6 +246,54 @@ async def save_energy_preferences(prefs: dict[str, Any]) -> Any:
     return await ha_ws_command("energy/save_prefs", {"energy_sources": prefs["energy_sources"], "device_consumption": prefs["device_consumption"], "device_consumption_water": prefs["device_consumption_water"]})
 
 
+async def get_hacs_info() -> dict[str, Any]:
+    """Inspect the optional HACS installation without assuming HA OS or Supervisor."""
+    hacs_dir = CONFIG_ROOT / "custom_components" / "hacs"
+    manifest_path = hacs_dir / "manifest.json"
+    storage_dir = CONFIG_ROOT / ".storage"
+    hacs_storage_path = storage_dir / "hacs.hacs"
+    repositories_path = storage_dir / "hacs.repositories"
+    if not (hacs_dir.is_dir() and manifest_path.is_file()):
+        return {"installed": False, "version": None, "latest_version": None, "update_available": False, "installed_repositories": [], "installed_repository_count": 0, "message": "HACS is not installed in the connected Home Assistant configuration directory."}
+    version = None
+    try:
+        version = json.loads(manifest_path.read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError):
+        pass
+    try:
+        raw=json.loads(hacs_storage_path.read_text(encoding="utf-8")); data=raw.get("data",raw) if isinstance(raw,dict) else {}
+        version=version or data.get("version")
+    except (OSError, ValueError):
+        pass
+    repositories=[]
+    try:
+        raw=json.loads(repositories_path.read_text(encoding="utf-8")); data=raw.get("data",raw) if isinstance(raw,dict) else {}
+        for repo in data.get("repositories",[]) if isinstance(data,dict) else []:
+            if not isinstance(repo,dict): continue
+            d=repo.get("data",{}) if isinstance(repo.get("data"),dict) else {}
+            if not bool(d.get("installed",repo.get("installed",False))): continue
+            repositories.append({k:v for k,v in {"full_name":d.get("full_name") or repo.get("full_name"),"name":d.get("name") or repo.get("name") or d.get("manifest_name"),"category":d.get("category") or repo.get("category"),"installed_version":d.get("installed_version") or repo.get("installed_version"),"latest_version":d.get("last_version") or repo.get("last_version"),"pending_restart":bool(d.get("pending_restart",repo.get("pending_restart",False)))}.items() if v not in (None,"")})
+    except (OSError, ValueError):
+        pass
+    def vk(v):
+        out=[]
+        for p in re.split(r"[.+\-_]",str(v or "").lstrip("vV")):
+            m=re.match(r"(\d+)",p); out.append((0,int(m.group(1))) if m else (1,p.casefold()))
+        return tuple(out)
+    latest_version=None; latest_url="https://github.com/hacs/integration/releases/latest"
+    try:
+        async with httpx.AsyncClient(timeout=HA_TIMEOUT,follow_redirects=True) as client:
+            r=await client.get("https://api.github.com/repos/hacs/integration/releases/latest",headers={"Accept":"application/vnd.github+json","User-Agent":"home-assistant-mcp"}); r.raise_for_status(); release=r.json(); latest_version=str(release.get("tag_name") or "").strip() or None; latest_url=str(release.get("html_url") or latest_url)
+    except (httpx.HTTPError,ValueError):
+        pass
+    update_available=bool(version and latest_version and vk(latest_version)>vk(version))
+    repo_updates=[]
+    for repo in repositories:
+        iv,lv=repo.get("installed_version"),repo.get("latest_version"); repo["update_available"]=bool(iv and lv and vk(lv)>vk(iv))
+        if repo["update_available"]: repo_updates.append(repo.get("full_name") or repo.get("name"))
+    return {"installed":True,"version":version,"latest_version":latest_version,"update_available":update_available,"latest_release_url":latest_url,"installed_repository_count":len(repositories),"repositories_with_updates":repo_updates,"installed_repositories":repositories,"storage_detected":{"hacs_hacs":hacs_storage_path.is_file(),"hacs_repositories":repositories_path.is_file()}}
+
+
 async def list_config_entries() -> list[dict[str, Any]]:
     return await ha_get("/api/config/config_entries/entry")
 
@@ -401,6 +449,7 @@ async def list_tools(context, params) -> ListToolsResult:
         Tool(name="delete_dashboard", description="Delete a storage-mode Lovelace dashboard. Destructive; list dashboards first and only delete on explicit user request.", inputSchema={"type": "object", "properties": {"dashboard_id": {"type": "string"}}, "required": ["dashboard_id"]}),
         Tool(name="get_energy_preferences", description="Read the Home Assistant built-in Energy Dashboard configuration, including grid, solar, battery and individual consumption sources. Returns configured=false when Energy has not been configured yet.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="get_energy_info", description="Read Home Assistant Energy Dashboard metadata.", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="get_hacs_info", description="Inspect HACS installation, version, installed repositories and available updates without assuming Home Assistant OS or Supervisor.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="search_energy_sources", description="Search current Home Assistant entities for sensors suitable for the Energy Dashboard. Returns candidates with unit, device_class and state_class.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}}),
         Tool(name="validate_energy_preferences", description="Validate the current Home Assistant Energy Dashboard configuration. Returns configured=false when Energy has not been configured yet.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="save_energy_preferences", description="Update the Home Assistant built-in Energy Dashboard. Read current preferences first and preserve unrelated settings.", inputSchema={"type": "object", "properties": {"prefs": {"type": "object"}}, "required": ["prefs"]}),
@@ -479,6 +528,8 @@ async def call_tool(context, params) -> CallToolResult:
         return text_result(await get_energy_preferences())
     if params.name == "get_energy_info":
         return text_result(await get_energy_info())
+    if params.name == "get_hacs_info":
+        return text_result(await get_hacs_info())
     if params.name == "search_energy_sources":
         query = normalize(args.get("query", "energy"))
         entities = await build_entity_index()

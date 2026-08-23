@@ -75,6 +75,14 @@ MAX_SEARCH_RESULTS=50
 
 **Never commit API keys, Home Assistant tokens, passwords or other secrets.**
 
+## Dynamic Home Assistant environment detection
+
+The Agent does not assume Home Assistant OS, Docker, QNAP or the Add-on Store. Before platform-dependent advice — for example Add-ons, Supervisor, MQTT installation, backups or updates — the Agent can call the MCP tool `get_home_assistant_info` and use the capabilities exposed by the connected Home Assistant instance.
+
+The tool reports the Home Assistant Core version and reliable capability signals such as Supervisor/Add-on availability. If Supervisor/Add-ons are not exposed, the Agent must not recommend the Add-on Store and should use a platform-neutral or external-service approach instead.
+
+The exact host type is intentionally not guessed when Home Assistant does not expose a reliable signal. This keeps the same Agent usable with different Home Assistant deployments.
+
 ## QNAP Deployment — Standalone Containers
 
 Create both containers directly in **QNAP Container Station → Create Container**. No Compose/Application is required.
@@ -109,6 +117,7 @@ The Agent UI provides a **KI-Modell** selector. Currently GPT and, when configur
 
 ### Read
 
+- `get_home_assistant_info` — detect connected Home Assistant version and exposed platform capabilities.
 - `search_entities` — find Home Assistant entities.
 - `get_entity_state` — read current state and attributes.
 
@@ -194,13 +203,15 @@ docker run -d --name home-assistant-agent --restart unless-stopped \
 Basic validation should cover:
 
 1. MCP endpoint and tool discovery.
-2. Entity search and state lookup.
-3. GPT tool calling through OpenAI.
-4. Claude tool calling through Anthropic.
-5. Controlled service calls.
-6. Configuration editing only when explicitly enabled.
-7. Conversational follow-ups such as `Ja` after an offered search/action.
-8. Agent `/health` and `/models` endpoints.
+2. Dynamic Home Assistant environment detection with `get_home_assistant_info`.
+3. Entity search and state lookup.
+4. GPT tool calling through OpenAI.
+5. Claude tool calling through Anthropic.
+6. Controlled service calls.
+7. Configuration editing only when explicitly enabled.
+8. Conversational follow-ups such as `Ja` after an offered search/action.
+9. Agent `/health` and `/models` endpoints.
+10. Platform-dependent advice must respect detected capabilities and must not assume Home Assistant OS.
 
 ## Security
 
@@ -233,4 +244,4 @@ home-assistant-agent/
 
 ## Current status
 
-The agent, MCP server and Home Assistant integration are validated end-to-end with the test Home Assistant. GPT is active, Claude is available when `ANTHROPIC_API_KEY` is configured, and Ollama is prepared as a future local provider. The Agent now also preserves recent chat context so short follow-up answers remain connected to the preceding request.
+The agent, MCP server and Home Assistant integration are validated end-to-end with the test Home Assistant. GPT is active, Claude is available when `ANTHROPIC_API_KEY` is configured, Ollama is prepared as a future local provider, recent chat context is preserved, and platform-dependent Home Assistant capabilities are now detected dynamically instead of assuming Home Assistant OS.

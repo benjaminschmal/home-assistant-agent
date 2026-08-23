@@ -1,0 +1,41 @@
+name: Fix version footer now
+on:
+  push:
+    paths:
+      - .github/workflows/fix-version-footer-now.yml
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fix footer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('agent/agent.py')
+          s = p.read_text()
+          s = s.replace('AGENT_VERSION = "1.13.0"', 'AGENT_VERSION = "1.13.1"', 1)
+          s = s.replace('<div class="footer" id="versionInfo">Agent v\' + \'AGENT_VERSION" – MCP wird geladen …</div>', '<div class="footer" id="versionInfo">Agent v1.13.1 · MCP wird geladen …</div>', 1)
+          s = s.replace('document.getElementById("versionInfo").textContent="Agent v\' + \'AGENT_VERSION" · MCP-Version nicht verfügbar"', 'document.getElementById("versionInfo").textContent="Agent v1.13.1 · MCP-Version nicht verfügbar"', 1)
+          compile(s, str(p), 'exec')
+          p.write_text(s)
+          PY
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent/agent.py
+          git diff --cached --check
+          git commit -m "fix: correct agent version footer"
+          git push
+      - name: Remove trigger workflow
+        run: |
+          git rm .github/workflows/fix-version-footer-now.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: remove temporary footer fix workflow"
+          git push

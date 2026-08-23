@@ -1,0 +1,50 @@
+name: Add version footer
+on:
+  push:
+    paths:
+      - .github/workflows/add-version-footer.yml
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch agent version and footer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('agent/agent.py')
+          s=p.read_text()
+          s=s.replace('MCP_URL = os.environ.get("MCP_URL", "").strip()\n', 'AGENT_VERSION = "1.13.0"\nMCP_URL = os.environ.get("MCP_URL", "").strip()\n', 1)
+          s=s.replace('.input-row{display:flex;gap:10px}input{flex:1;padding:14px;border:1px solid #ccc;border-radius:8px;font-size:16px}button{padding:14px 22px;border:0;border-radius:8px;background:#1976d2;color:white;font-size:16px;cursor:pointer}button:disabled{opacity:.5}</style></head>', '.input-row{display:flex;gap:10px}input{flex:1;padding:14px;border:1px solid #ccc;border-radius:8px;font-size:16px}button{padding:14px 22px;border:0;border-radius:8px;background:#1976d2;color:white;font-size:16px;cursor:pointer}button:disabled{opacity:.5}.footer{margin-top:14px;text-align:center;font-size:12px;color:#888}</style></head>', 1)
+          s=s.replace('<div class="input-row"><input id="message" type="text" placeholder="z.B. Wie warm ist der Vorlauf?" autocomplete="off"/><button id="send">Senden</button></div></div>', '<div class="input-row"><input id="message" type="text" placeholder="z.B. Wie warm ist der Vorlauf?" autocomplete="off"/><button id="send">Senden</button></div><div class="footer" id="versionInfo">Agent v'+"' + '"+'AGENT_VERSION'+'"'+' – MCP wird geladen …</div></div>', 1)
+          s=s.replace('button.addEventListener("click",sendMessage);input.addEventListener("keydown",event=>{if(event.key==="Enter")sendMessage()});input.focus();loadModels();', 'async function loadVersion(){try{const response=await fetch("/version");const data=await response.json();document.getElementById("versionInfo").textContent=`Agent v${data.agent_version} · MCP v${data.mcp_version||"unbekannt"}`;}catch(error){document.getElementById("versionInfo").textContent="Agent v'+"' + '"+'AGENT_VERSION'+'"'+' · MCP-Version nicht verfügbar"}}\nbutton.addEventListener("click",sendMessage);input.addEventListener("keydown",event=>{if(event.key==="Enter")sendMessage()});input.focus();loadModels();loadVersion();', 1)
+          marker='@app.get("/health")\nasync def health():\n'
+          endpoint='@app.get("/version")\nasync def version_endpoint():\n    mcp_version = None\n    try:\n        async with streamable_http_client(MCP_URL) as (read_stream,write_stream):\n            async with ClientSession(read_stream,write_stream) as session:\n                init = await run_with_timeout(session.initialize(),MCP_TIMEOUT,"MCP version discovery")\n                server_info = getattr(init, "server_info", None)\n                mcp_version = getattr(server_info, "version", None) if server_info else None\n    except Exception as exc:\n        logger.warning("MCP version discovery failed: %s", exc)\n    return {"agent_version": AGENT_VERSION, "mcp_version": mcp_version}\n\n'+marker
+          if marker not in s: raise SystemExit('health marker not found')
+          s=s.replace(marker,endpoint,1)
+          p.write_text(s)
+          compile(s,'agent.py','exec')
+          PY
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent/agent.py .github/workflows/add-version-footer.yml
+          git diff --cached --check
+          git commit -m "feat: show agent and MCP versions in footer"
+          git push
+      - name: Remove temporary workflow
+        if: always()
+        run: |
+          git checkout main
+          if [ -f .github/workflows/add-version-footer.yml ]; then
+            git rm .github/workflows/add-version-footer.yml
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: remove temporary version footer workflow"
+            git push
+          fi

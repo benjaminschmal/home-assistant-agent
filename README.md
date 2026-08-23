@@ -58,6 +58,7 @@ ANTHROPIC_TIMEOUT_SECONDS=60
 MCP_URL=http://<MCP_HOST>:8000/mcp
 MCP_TIMEOUT_SECONDS=15
 OPENAI_TIMEOUT_SECONDS=60
+RELEASE_CHECK_TIMEOUT_SECONDS=10
 MAX_TOOL_ROUNDS=8
 MAX_HISTORY_MESSAGES=12
 LOG_LEVEL=INFO
@@ -73,6 +74,8 @@ MAX_SEARCH_RESULTS=50
 
 `MAX_HISTORY_MESSAGES` controls how many recent user/assistant messages are supplied to the model. This keeps short follow-up replies such as **"Ja"**, **"Mach das"** or **"Weiter"** in context without creating an unbounded conversation history. Default: `12`.
 
+`RELEASE_CHECK_TIMEOUT_SECONDS` controls the timeout for checking the current stable Home Assistant Core release. Default: `10` seconds.
+
 **Never commit API keys, Home Assistant tokens, passwords or other secrets.**
 
 ## Dynamic Home Assistant environment detection
@@ -80,6 +83,8 @@ MAX_SEARCH_RESULTS=50
 The Agent does not assume Home Assistant OS, Docker, QNAP or the Add-on Store. Before platform-dependent advice — for example Add-ons, Supervisor, MQTT installation, backups or updates — the Agent can call the MCP tool `get_home_assistant_info` and use the capabilities exposed by the connected Home Assistant instance.
 
 The tool reports the Home Assistant Core version and reliable capability signals such as Supervisor/Add-on availability. If Supervisor/Add-ons are not exposed, the Agent must not recommend the Add-on Store and should use a platform-neutral or external-service approach instead.
+
+For questions such as **"Is my Home Assistant up to date?"**, the Agent additionally checks the current stable Home Assistant Core release from the official Home Assistant Core GitHub release endpoint. It compares that verified release with the connected installation version instead of assuming that a recent-looking version is current. If the release check fails, the Agent must say that current release status could not be verified rather than guessing.
 
 The exact host type is intentionally not guessed when Home Assistant does not expose a reliable signal. This keeps the same Agent usable with different Home Assistant deployments.
 
@@ -107,7 +112,7 @@ ghcr.io/benjaminschmal/home-assistant-agent:latest
 Name: `home-assistant-agent`  
 Port: `8080 → 8080/TCP`
 
-Environment: `OPENAI_API_KEY`, `OPENAI_MODEL`, optional `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_TIMEOUT_SECONDS`, plus `MCP_URL`, `MCP_TIMEOUT_SECONDS`, `OPENAI_TIMEOUT_SECONDS`, `MAX_TOOL_ROUNDS`, `MAX_HISTORY_MESSAGES`, `LOG_LEVEL`.
+Environment: `OPENAI_API_KEY`, `OPENAI_MODEL`, optional `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_TIMEOUT_SECONDS`, plus `MCP_URL`, `MCP_TIMEOUT_SECONDS`, `OPENAI_TIMEOUT_SECONDS`, `RELEASE_CHECK_TIMEOUT_SECONDS`, `MAX_TOOL_ROUNDS`, `MAX_HISTORY_MESSAGES`, `LOG_LEVEL`.
 
 Recommended restart policy: `unless-stopped`. The **Application** column should remain `--` for both containers.
 
@@ -192,6 +197,7 @@ docker run -d --name home-assistant-agent --restart unless-stopped \
   -e MCP_URL=http://<MCP_HOST>:8000/mcp \
   -e MCP_TIMEOUT_SECONDS=15 \
   -e OPENAI_TIMEOUT_SECONDS=60 \
+  -e RELEASE_CHECK_TIMEOUT_SECONDS=10 \
   -e MAX_TOOL_ROUNDS=8 \
   -e MAX_HISTORY_MESSAGES=12 \
   -e LOG_LEVEL=INFO \
@@ -204,14 +210,15 @@ Basic validation should cover:
 
 1. MCP endpoint and tool discovery.
 2. Dynamic Home Assistant environment detection with `get_home_assistant_info`.
-3. Entity search and state lookup.
-4. GPT tool calling through OpenAI.
-5. Claude tool calling through Anthropic.
-6. Controlled service calls.
-7. Configuration editing only when explicitly enabled.
-8. Conversational follow-ups such as `Ja` after an offered search/action.
-9. Agent `/health` and `/models` endpoints.
-10. Platform-dependent advice must respect detected capabilities and must not assume Home Assistant OS.
+3. Home Assistant release verification for current/latest/update questions.
+4. Entity search and state lookup.
+5. GPT tool calling through OpenAI.
+6. Claude tool calling through Anthropic.
+7. Controlled service calls.
+8. Configuration editing only when explicitly enabled.
+9. Conversational follow-ups such as `Ja` after an offered search/action.
+10. Agent `/health` and `/models` endpoints.
+11. Platform-dependent advice must respect detected capabilities and must not assume Home Assistant OS.
 
 ## Security
 
@@ -244,4 +251,4 @@ home-assistant-agent/
 
 ## Current status
 
-The agent, MCP server and Home Assistant integration are validated end-to-end with the test Home Assistant. GPT is active, Claude is available when `ANTHROPIC_API_KEY` is configured, Ollama is prepared as a future local provider, recent chat context is preserved, and platform-dependent Home Assistant capabilities are now detected dynamically instead of assuming Home Assistant OS.
+The agent, MCP server and Home Assistant integration are validated end-to-end with the test Home Assistant. GPT is active, Claude is available when `ANTHROPIC_API_KEY` is configured, Ollama is prepared as a future local provider, recent chat context is preserved, platform-dependent Home Assistant capabilities are detected dynamically, and current Home Assistant release status can be verified for version/update questions.

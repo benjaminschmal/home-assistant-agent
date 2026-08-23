@@ -147,40 +147,89 @@ async def save_energy_preferences(prefs: dict[str, Any]) -> Any:
     return await ha_ws_command("energy/save_prefs", {k: prefs[k] for k in required})
 
 async def get_hacs_info() -> dict[str, Any]:
-    """Inspect HACS v2 storage and distinguish managed repositories from locally installed content."""
+    """Inspect HACS directly through its websocket API and report installed repositories and update state."""
     hacs_dir = CONFIG_ROOT / "custom_components" / "hacs"
     manifest_path = hacs_dir / "manifest.json"
-    storage_dir = CONFIG_ROOT / ".storage"
-    repositories_path = storage_dir / "hacs.repositories"
     if not (hacs_dir.is_dir() and manifest_path.is_file()):
         return {"installed": False, "version": None, "latest_version": None, "update_available": False, "managed_repository_count": 0, "installed_repository_count": 0, "installed_repositories": [], "message": "HACS is not installed."}
     try: version = json.loads(manifest_path.read_text(encoding="utf-8")).get("version")
     except (OSError, ValueError): version = None
-    managed=[]; installed=[]; storage_error=None
+
+    def version_key(value: Any) -> tuple:
+        return tuple((0, int(match.group(1))) if (match := re.match(r"(\d+)", part)) else (1, part.casefold()) for part in re.split(r"[.+\-_]", str(value or "").lstrip("vV")))
+
+    latest_version = None
     try:
-        raw=json.loads(repositories_path.read_text(encoding="utf-8")); data=raw.get("data",{}) if isinstance(raw,dict) else {}
-        items=data.values() if isinstance(data,dict) else []
-        for repo in items:
-            if not isinstance(repo,dict) or not repo.get("full_name"): continue
-            domain=repo.get("domain"); category=repo.get("category"); full_name=repo["full_name"]
-            entry={"full_name":full_name,"category":category,"domain":domain,"description":repo.get("description")}
+        async with httpx.AsyncClient(timeout=HA_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get("https://api.github.com/repos/hacs/integration/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "home-assistant-mcp"})
+            response.raise_for_status()
+            latest_version = str(response.json().get("tag_name") or "") or None
+    except (httpx.HTTPError, ValueError):
+        pass
+
+    managed = []
+    installed = []
+    source = "hacs_websocket"
+    storage_error = None
+    try:
+        repositories = await ha_ws_command("hacs/repositories/list") or []
+        for repo in repositories:
+            if not isinstance(repo, dict) or not repo.get("full_name"):
+                continue
+            full_name = str(repo.get("full_name"))
+            # HACS itself is the manager, not an installed HACS repository for the user.
+            if full_name.casefold() == "hacs/integration":
+                continue
+            installed_flag = bool(repo.get("installed"))
+            installed_version = repo.get("installed_version")
+            available_version = repo.get("available_version")
+            pending_upgrade = bool(repo.get("pending_upgrade"))
+            version_update = bool(installed_version and available_version and version_key(available_version) > version_key(installed_version))
+            update_available = pending_upgrade or version_update
+            entry = {
+                "full_name": full_name,
+                "name": repo.get("name"),
+                "category": repo.get("category"),
+                "domain": repo.get("domain"),
+                "description": repo.get("description"),
+                "installed": installed_flag,
+                "installed_version": installed_version,
+                "available_version": available_version,
+                "update_available": update_available,
+                "status": repo.get("status"),
+                "pending_upgrade": pending_upgrade,
+                "local_path": repo.get("local_path"),
+            }
             managed.append(entry)
-            local=False
-            if category == "integration" and domain:
-                local=(CONFIG_ROOT / "custom_components" / str(domain)).is_dir()
-            elif category == "plugin":
-                name=full_name.split("/",1)[-1].lower()
-                local=any(p.is_file() for root in (CONFIG_ROOT / "www", CONFIG_ROOT / "www" / "community") if root.exists() for p in root.rglob("*") if name in p.name.lower())
-            if local:
+            if installed_flag:
                 installed.append(entry)
-    except (OSError, ValueError, TypeError) as exc: storage_error=str(exc)
-    latest_version=None
-    try:
-        async with httpx.AsyncClient(timeout=HA_TIMEOUT,follow_redirects=True) as client:
-            r=await client.get("https://api.github.com/repos/hacs/integration/releases/latest",headers={"Accept":"application/vnd.github+json","User-Agent":"home-assistant-mcp"}); r.raise_for_status(); latest_version=str(r.json().get("tag_name") or "") or None
-    except (httpx.HTTPError,ValueError): pass
-    def ver(v): return tuple((0,int(m.group(1))) if (m:=re.match(r"(\d+)",p)) else (1,p.casefold()) for p in re.split(r"[.+\-_]",str(v or "").lstrip("vV")))
-    return {"installed":True,"version":version,"latest_version":latest_version,"update_available":bool(version and latest_version and ver(latest_version)>ver(version)),"managed_repository_count":len(managed),"installed_repository_count":len(installed),"installed_repositories":installed,"managed_repositories":managed,"storage_format":"v6_data_mapping","storage_error":storage_error}
+    except RuntimeError as exc:
+        source = "storage_fallback"
+        storage_error = str(exc)
+        repositories_path = CONFIG_ROOT / ".storage" / "hacs.repositories"
+        try:
+            raw = json.loads(repositories_path.read_text(encoding="utf-8"))
+            data = raw.get("data", {}) if isinstance(raw, dict) else {}
+            items = data.values() if isinstance(data, dict) else []
+            for repo in items:
+                if not isinstance(repo, dict) or not repo.get("full_name"):
+                    continue
+                full_name = str(repo.get("full_name"))
+                if full_name.casefold() == "hacs/integration":
+                    continue
+                category = repo.get("category")
+                domain = repo.get("domain")
+                local = False
+                if category == "integration" and domain:
+                    local = (CONFIG_ROOT / "custom_components" / str(domain)).is_dir()
+                entry = {"full_name": full_name, "name": repo.get("name"), "category": category, "domain": domain, "description": repo.get("description"), "installed": local, "installed_version": None, "available_version": None, "update_available": None, "status": None, "pending_upgrade": None, "local_path": None}
+                managed.append(entry)
+                if local:
+                    installed.append(entry)
+        except (OSError, ValueError, TypeError) as fallback_exc:
+            storage_error = f"{storage_error}; fallback failed: {fallback_exc}"
+
+    return {"installed": True, "version": version, "latest_version": latest_version, "update_available": bool(version and latest_version and version_key(latest_version) > version_key(version)), "managed_repository_count": len(managed), "installed_repository_count": len(installed), "installed_repositories": installed, "managed_repositories": managed, "source": source, "storage_error": storage_error}
 
 async def list_config_entries() -> list[dict[str, Any]]: return await ha_get("/api/config/config_entries/entry")
 async def start_config_flow(handler: str, user_input: dict[str, Any] | None = None) -> dict[str, Any]: return await ha_post("/api/config/config_entries/flow", {"handler":handler, **({"data":user_input} if user_input is not None else {})})
@@ -221,7 +270,7 @@ def normalize(value: Any) -> str: return re.sub(r"[^a-z0-9]+"," ",str(value or "
 def text_result(value: Any) -> CallToolResult: return CallToolResult(content=[TextContent(type="text",text=json.dumps(value,ensure_ascii=False,indent=2) if not isinstance(value,str) else value)])
 
 async def list_tools(context, params) -> ListToolsResult:
-    return ListToolsResult(tools=[Tool(name="get_hacs_info",description="Inspect HACS installation, HACS version, managed repositories and locally installed repositories without assuming Home Assistant OS or Supervisor.",inputSchema={"type":"object","properties":{}}),Tool(name="get_home_assistant_info",description="Detect connected Home Assistant version and capabilities.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_preferences",description="Read Energy Dashboard preferences.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_info",description="Read Energy Dashboard metadata.",inputSchema={"type":"object","properties":{}}),Tool(name="validate_energy_preferences",description="Validate Energy Dashboard configuration.",inputSchema={"type":"object","properties":{}}),Tool(name="search_entities",description="Search Home Assistant entities.",inputSchema={"type":"object","properties":{"query":{"type":"string"}}}),Tool(name="get_entity_state",description="Read an entity state.",inputSchema={"type":"object","properties":{"entity_id":{"type":"string"}},"required":["entity_id"]}),Tool(name="list_config_entries",description="List configured integrations.",inputSchema={"type":"object","properties":{"domain":{"type":"string"}}})])
+    return ListToolsResult(tools=[Tool(name="get_hacs_info",description="Inspect HACS installation, HACS version, installed HACS repositories and their current/update status directly from HACS without assuming Home Assistant OS or Supervisor.",inputSchema={"type":"object","properties":{}}),Tool(name="get_home_assistant_info",description="Detect connected Home Assistant version and capabilities.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_preferences",description="Read Energy Dashboard preferences.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_info",description="Read Energy Dashboard metadata.",inputSchema={"type":"object","properties":{}}),Tool(name="validate_energy_preferences",description="Validate Energy Dashboard configuration.",inputSchema={"type":"object","properties":{}}),Tool(name="search_entities",description="Search Home Assistant entities.",inputSchema={"type":"object","properties":{"query":{"type":"string"}}}),Tool(name="get_entity_state",description="Read an entity state.",inputSchema={"type":"object","properties":{"entity_id":{"type":"string"}},"required":["entity_id"]}),Tool(name="list_config_entries",description="List configured integrations.",inputSchema={"type":"object","properties":{"domain":{"type":"string"}}})])
 
 async def call_tool(context, params) -> CallToolResult:
     args=params.arguments or {}
@@ -238,7 +287,7 @@ async def call_tool(context, params) -> CallToolResult:
     if params.name=="get_entity_state": return text_result(await ha_get(f"/api/states/{args.get('entity_id')}"))
     raise ValueError(f"Unknown tool: {params.name}")
 
-server=Server("home-assistant-mcp",version="1.11.2",on_list_tools=list_tools,on_call_tool=call_tool)
+server=Server("home-assistant-mcp",version="1.12.0",on_list_tools=list_tools,on_call_tool=call_tool)
 
 async def main():
     app=server.streamable_http_app(streamable_http_path="/mcp",host="0.0.0.0",stateless_http=True)

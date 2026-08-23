@@ -202,7 +202,23 @@ async def delete_dashboard(dashboard_id: str) -> Any:
 
 
 async def get_energy_preferences() -> dict[str, Any]:
-    return await ha_ws_command("energy/get_prefs") or {"energy_sources": [], "device_consumption": [], "device_consumption_water": []}
+    """Read Energy Dashboard preferences without treating an unconfigured dashboard as an error."""
+    try:
+        result = await ha_ws_command("energy/get_prefs")
+    except RuntimeError as exc:
+        if str(exc).endswith("No prefs"):
+            return {
+                "configured": False,
+                "energy_sources": [],
+                "device_consumption": [],
+                "device_consumption_water": [],
+                "message": "The Home Assistant Energy Dashboard is not configured yet."
+            }
+        raise
+    return {
+        "configured": True,
+        **(result or {"energy_sources": [], "device_consumption": [], "device_consumption_water": []})
+    }
 
 
 async def get_energy_info() -> dict[str, Any]:
@@ -210,7 +226,12 @@ async def get_energy_info() -> dict[str, Any]:
 
 
 async def validate_energy_preferences() -> dict[str, Any]:
-    return await ha_ws_command("energy/validate") or {}
+    try:
+        return await ha_ws_command("energy/validate") or {}
+    except RuntimeError as exc:
+        if str(exc).endswith("No prefs"):
+            return {"configured": False, "valid": False, "message": "The Home Assistant Energy Dashboard is not configured yet."}
+        raise
 
 
 async def save_energy_preferences(prefs: dict[str, Any]) -> Any:
@@ -378,10 +399,10 @@ async def list_tools(context, params) -> ListToolsResult:
         Tool(name="create_dashboard", description="Create a storage-mode Lovelace dashboard. Existing url_path values are detected before creation and returned as a clear warning.", inputSchema={"type": "object", "properties": {"url_path": {"type": "string"}, "title": {"type": "string"}, "icon": {"type": "string"}, "show_in_sidebar": {"type": "boolean"}, "require_admin": {"type": "boolean"}}, "required": ["url_path", "title"]}),
         Tool(name="update_dashboard", description="Save a complete storage-mode Lovelace dashboard configuration. Read it first and preserve unrelated content.", inputSchema={"type": "object", "properties": {"url_path": {"type": "string"}, "config": {"type": "object"}}, "required": ["url_path", "config"]}),
         Tool(name="delete_dashboard", description="Delete a storage-mode Lovelace dashboard. Destructive; list dashboards first and only delete on explicit user request.", inputSchema={"type": "object", "properties": {"dashboard_id": {"type": "string"}}, "required": ["dashboard_id"]}),
-        Tool(name="get_energy_preferences", description="Read the Home Assistant built-in Energy Dashboard configuration, including grid, solar, battery and individual consumption sources.", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="get_energy_preferences", description="Read the Home Assistant built-in Energy Dashboard configuration, including grid, solar, battery and individual consumption sources. Returns configured=false when Energy has not been configured yet.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="get_energy_info", description="Read Home Assistant Energy Dashboard metadata.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="search_energy_sources", description="Search current Home Assistant entities for sensors suitable for the Energy Dashboard. Returns candidates with unit, device_class and state_class.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}}),
-        Tool(name="validate_energy_preferences", description="Validate the current Home Assistant Energy Dashboard configuration.", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="validate_energy_preferences", description="Validate the current Home Assistant Energy Dashboard configuration. Returns configured=false when Energy has not been configured yet.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="save_energy_preferences", description="Update the Home Assistant built-in Energy Dashboard. Read current preferences first and preserve unrelated settings.", inputSchema={"type": "object", "properties": {"prefs": {"type": "object"}}, "required": ["prefs"]}),
         Tool(name="list_config_entries", description="List configured Home Assistant integrations/config entries. Use before adding an integration to detect existing entries.", inputSchema={"type": "object", "properties": {"domain": {"type": "string"}}}),
         Tool(name="start_integration_setup", description="Start a Home Assistant integration config flow. Use list_config_entries first.", inputSchema={"type": "object", "properties": {"domain": {"type": "string"}, "user_input": {"type": "object"}}, "required": ["domain"]}),
@@ -515,7 +536,7 @@ async def call_tool(context, params) -> CallToolResult:
     raise ValueError(f"Unknown tool: {params.name}")
 
 
-server = Server("home-assistant-mcp", version="1.11.0", on_list_tools=list_tools, on_call_tool=call_tool)
+server = Server("home-assistant-mcp", version="1.11.1", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 async def main():

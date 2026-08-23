@@ -58,7 +58,8 @@ ANTHROPIC_TIMEOUT_SECONDS=60
 MCP_URL=http://<MCP_HOST>:8000/mcp
 MCP_TIMEOUT_SECONDS=15
 OPENAI_TIMEOUT_SECONDS=60
-MAX_TOOL_ROUNDS=5
+MAX_TOOL_ROUNDS=8
+MAX_HISTORY_MESSAGES=12
 LOG_LEVEL=INFO
 
 # MCP
@@ -69,6 +70,8 @@ MAX_SEARCH_RESULTS=50
 ```
 
 `ANTHROPIC_API_KEY` is optional. If it is configured, **Claude** becomes available in the Agent's model selector. OpenAI remains the default. Ollama is prepared in the UI but not active yet.
+
+`MAX_HISTORY_MESSAGES` controls how many recent user/assistant messages are supplied to the model. This keeps short follow-up replies such as **"Ja"**, **"Mach das"** or **"Weiter"** in context without creating an unbounded conversation history. Default: `12`.
 
 **Never commit API keys, Home Assistant tokens, passwords or other secrets.**
 
@@ -96,7 +99,7 @@ ghcr.io/benjaminschmal/home-assistant-agent:latest
 Name: `home-assistant-agent`  
 Port: `8080 → 8080/TCP`
 
-Environment: `OPENAI_API_KEY`, `OPENAI_MODEL`, optional `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_TIMEOUT_SECONDS`, plus `MCP_URL`, `MCP_TIMEOUT_SECONDS`, `OPENAI_TIMEOUT_SECONDS`, `MAX_TOOL_ROUNDS`, `LOG_LEVEL`.
+Environment: `OPENAI_API_KEY`, `OPENAI_MODEL`, optional `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_TIMEOUT_SECONDS`, plus `MCP_URL`, `MCP_TIMEOUT_SECONDS`, `OPENAI_TIMEOUT_SECONDS`, `MAX_TOOL_ROUNDS`, `MAX_HISTORY_MESSAGES`, `LOG_LEVEL`.
 
 Recommended restart policy: `unless-stopped`. The **Application** column should remain `--` for both containers.
 
@@ -180,7 +183,8 @@ docker run -d --name home-assistant-agent --restart unless-stopped \
   -e MCP_URL=http://<MCP_HOST>:8000/mcp \
   -e MCP_TIMEOUT_SECONDS=15 \
   -e OPENAI_TIMEOUT_SECONDS=60 \
-  -e MAX_TOOL_ROUNDS=5 \
+  -e MAX_TOOL_ROUNDS=8 \
+  -e MAX_HISTORY_MESSAGES=12 \
   -e LOG_LEVEL=INFO \
   ghcr.io/benjaminschmal/home-assistant-agent:latest
 ```
@@ -195,7 +199,8 @@ Basic validation should cover:
 4. Claude tool calling through Anthropic.
 5. Controlled service calls.
 6. Configuration editing only when explicitly enabled.
-7. Agent `/health` and `/models` endpoints.
+7. Conversational follow-ups such as `Ja` after an offered search/action.
+8. Agent `/health` and `/models` endpoints.
 
 ## Security
 
@@ -228,4 +233,4 @@ home-assistant-agent/
 
 ## Current status
 
-The agent, MCP server and Home Assistant integration are validated end-to-end with the test Home Assistant. GPT is active, Claude is available when `ANTHROPIC_API_KEY` is configured, and Ollama is prepared as a future local provider.
+The agent, MCP server and Home Assistant integration are validated end-to-end with the test Home Assistant. GPT is active, Claude is available when `ANTHROPIC_API_KEY` is configured, and Ollama is prepared as a future local provider. The Agent now also preserves recent chat context so short follow-up answers remain connected to the preceding request.

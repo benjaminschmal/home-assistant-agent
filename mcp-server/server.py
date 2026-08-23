@@ -247,51 +247,85 @@ async def save_energy_preferences(prefs: dict[str, Any]) -> Any:
 
 
 async def get_hacs_info() -> dict[str, Any]:
-    """Inspect the optional HACS installation without assuming HA OS or Supervisor."""
+    """Inspect HACS and reliably report repositories downloaded through HACS."""
     hacs_dir = CONFIG_ROOT / "custom_components" / "hacs"
     manifest_path = hacs_dir / "manifest.json"
     storage_dir = CONFIG_ROOT / ".storage"
     hacs_storage_path = storage_dir / "hacs.hacs"
     repositories_path = storage_dir / "hacs.repositories"
+
     if not (hacs_dir.is_dir() and manifest_path.is_file()):
         return {"installed": False, "version": None, "latest_version": None, "update_available": False, "installed_repositories": [], "installed_repository_count": 0, "message": "HACS is not installed in the connected Home Assistant configuration directory."}
+
     version = None
     try:
         version = json.loads(manifest_path.read_text(encoding="utf-8")).get("version")
     except (OSError, ValueError):
         pass
     try:
-        raw=json.loads(hacs_storage_path.read_text(encoding="utf-8")); data=raw.get("data",raw) if isinstance(raw,dict) else {}
-        version=version or data.get("version")
+        raw = json.loads(hacs_storage_path.read_text(encoding="utf-8"))
+        data = raw.get("data", raw) if isinstance(raw, dict) else {}
+        if isinstance(data, dict):
+            version = version or data.get("version")
     except (OSError, ValueError):
         pass
-    repositories=[]
+
+    repositories: list[dict[str, Any]] = []
+    storage_error = None
+    storage_format = None
     try:
-        raw=json.loads(repositories_path.read_text(encoding="utf-8")); data=raw.get("data",raw) if isinstance(raw,dict) else {}
-        for repo in data.get("repositories",[]) if isinstance(data,dict) else []:
-            if not isinstance(repo,dict): continue
-            d=repo.get("data",{}) if isinstance(repo.get("data"),dict) else {}
-            if not bool(d.get("installed",repo.get("installed",False))): continue
-            repositories.append({k:v for k,v in {"full_name":d.get("full_name") or repo.get("full_name"),"name":d.get("name") or repo.get("name") or d.get("manifest_name"),"category":d.get("category") or repo.get("category"),"installed_version":d.get("installed_version") or repo.get("installed_version"),"latest_version":d.get("last_version") or repo.get("last_version"),"pending_restart":bool(d.get("pending_restart",repo.get("pending_restart",False)))}.items() if v not in (None,"")})
-    except (OSError, ValueError):
-        pass
-    def vk(v):
-        out=[]
-        for p in re.split(r"[.+\-_]",str(v or "").lstrip("vV")):
-            m=re.match(r"(\d+)",p); out.append((0,int(m.group(1))) if m else (1,p.casefold()))
+        raw = json.loads(repositories_path.read_text(encoding="utf-8"))
+        data = raw.get("data", raw) if isinstance(raw, dict) else {}
+        raw_repositories = data.get("repositories", []) if isinstance(data, dict) else []
+        if isinstance(raw_repositories, dict):
+            raw_repositories = list(raw_repositories.values())
+            storage_format = "mapping"
+        elif isinstance(raw_repositories, list):
+            storage_format = "list"
+        else:
+            raw_repositories = []
+            storage_format = type(raw_repositories).__name__
+        for repo in raw_repositories:
+            if not isinstance(repo, dict):
+                continue
+            repo_data = repo.get("data") if isinstance(repo.get("data"), dict) else repo
+            if not bool(repo_data.get("installed", False)):
+                continue
+            full_name = repo_data.get("full_name") or repo.get("full_name")
+            name = repo_data.get("name") or repo.get("name") or repo_data.get("manifest_name") or (full_name.split("/", 1)[-1] if isinstance(full_name, str) else None)
+            repositories.append({"full_name": full_name, "name": name, "category": repo_data.get("category") or repo.get("category"), "installed_version": repo_data.get("installed_version") or repo.get("installed_version"), "latest_version": repo_data.get("last_version") or repo.get("last_version"), "pending_restart": bool(repo_data.get("pending_restart", repo.get("pending_restart", False))), "source": "hacs.repositories"})
+    except (OSError, ValueError, TypeError) as exc:
+        storage_error = str(exc)
+
+    def vk(value: Any) -> tuple:
+        out = []
+        for part in re.split(r"[.+\-_]", str(value or "").lstrip("vV")):
+            match = re.match(r"(\d+)", part)
+            out.append((0, int(match.group(1))) if match else (1, part.casefold()))
         return tuple(out)
-    latest_version=None; latest_url="https://github.com/hacs/integration/releases/latest"
+
+    latest_version = None
+    latest_url = "https://github.com/hacs/integration/releases/latest"
     try:
-        async with httpx.AsyncClient(timeout=HA_TIMEOUT,follow_redirects=True) as client:
-            r=await client.get("https://api.github.com/repos/hacs/integration/releases/latest",headers={"Accept":"application/vnd.github+json","User-Agent":"home-assistant-mcp"}); r.raise_for_status(); release=r.json(); latest_version=str(release.get("tag_name") or "").strip() or None; latest_url=str(release.get("html_url") or latest_url)
-    except (httpx.HTTPError,ValueError):
+        async with httpx.AsyncClient(timeout=HA_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get("https://api.github.com/repos/hacs/integration/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "home-assistant-mcp"})
+            response.raise_for_status()
+            release = response.json()
+            latest_version = str(release.get("tag_name") or "").strip() or None
+            latest_url = str(release.get("html_url") or latest_url)
+    except (httpx.HTTPError, ValueError):
         pass
-    update_available=bool(version and latest_version and vk(latest_version)>vk(version))
-    repo_updates=[]
+
+    update_available = bool(version and latest_version and vk(latest_version) > vk(version))
+    repositories_with_updates = []
     for repo in repositories:
-        iv,lv=repo.get("installed_version"),repo.get("latest_version"); repo["update_available"]=bool(iv and lv and vk(lv)>vk(iv))
-        if repo["update_available"]: repo_updates.append(repo.get("full_name") or repo.get("name"))
-    return {"installed":True,"version":version,"latest_version":latest_version,"update_available":update_available,"latest_release_url":latest_url,"installed_repository_count":len(repositories),"repositories_with_updates":repo_updates,"installed_repositories":repositories,"storage_detected":{"hacs_hacs":hacs_storage_path.is_file(),"hacs_repositories":repositories_path.is_file()}}
+        installed_version = repo.get("installed_version")
+        available_version = repo.get("latest_version")
+        repo["update_available"] = bool(installed_version and available_version and vk(available_version) > vk(installed_version))
+        if repo["update_available"]:
+            repositories_with_updates.append(repo.get("full_name") or repo.get("name"))
+
+    return {"installed": True, "version": version, "latest_version": latest_version, "update_available": update_available, "latest_release_url": latest_url, "installed_repository_count": len(repositories), "repositories_with_updates": repositories_with_updates, "installed_repositories": repositories, "storage_detected": {"hacs_hacs": hacs_storage_path.is_file(), "hacs_repositories": repositories_path.is_file()}, "storage_format": storage_format, "storage_error": storage_error}
 
 
 async def list_config_entries() -> list[dict[str, Any]]:

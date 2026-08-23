@@ -15,4 +15,4 @@ RUN useradd --create-home --uid 1000 agent \
 
 USER agent
 
-CMD ["python", "-c", "import asyncio, server, hacs_status; server.get_hacs_info = hacs_status.get_hacs_info; asyncio.run(server.main())"]
+CMD ["python", "-c", "import asyncio, server, hacs_status; server.get_hacs_info = hacs_status.get_hacs_info; server.server.version = '1.12.1'; asyncio.run(server.main())"]

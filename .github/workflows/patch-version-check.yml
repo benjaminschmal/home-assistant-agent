@@ -1,6 +1,9 @@
 name: Patch public Git version check
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -23,36 +26,36 @@ jobs:
 
           old = 'RELEASE_CHECK_TIMEOUT = float(os.environ.get("RELEASE_CHECK_TIMEOUT_SECONDS", "10"))\nMAX_TOOL_ROUNDS'
           new = 'RELEASE_CHECK_TIMEOUT = float(os.environ.get("RELEASE_CHECK_TIMEOUT_SECONDS", "10"))\nPUBLIC_GIT_CHECK_TIMEOUT = float(os.environ.get("PUBLIC_GIT_CHECK_TIMEOUT_SECONDS", "8"))\nMAX_TOOL_ROUNDS'
-          if old not in text:
-              raise SystemExit("Could not find timeout block")
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
 
           old = 'async function loadVersion(){try{const response=await fetch("/version");const data=await response.json();document.getElementById("versionInfo").textContent=`Agent v${data.agent_version} · MCP v${data.mcp_version||"unbekannt"}`;}catch(error){document.getElementById("versionInfo").textContent="Agent v1.13.1 · MCP-Version nicht verfügbar"}}'
           new = '''async function loadVersion(){try{const response=await fetch("/version"),data=await response.json();let text=`Agent v${data.agent_version} · MCP v${data.mcp_version||"unbekannt"}`;if(data.public_update_available){text+=` · ⚠ Neue Version verfügbar: Agent v${data.public_agent_version}`;}document.getElementById("versionInfo").textContent=text;}catch(error){document.getElementById("versionInfo").textContent="Agent v1.13.1 · MCP-Version nicht verfügbar"}}'''
-          if old not in text:
-              raise SystemExit("Could not find loadVersion function")
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
 
           marker = 'async def get_latest_home_assistant_release() -> dict[str, str | bool | None]:'
           insert = '''async def get_public_git_version() -> dict[str, str | bool | None]:\n    """Check the public main branch for the latest agent version."""\n    url="https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/agent.py"\n    def fetch_source():\n        request=urllib.request.Request(url,headers={"User-Agent":"home-assistant-agent"})\n        with urllib.request.urlopen(request,timeout=PUBLIC_GIT_CHECK_TIMEOUT) as response:\n            return response.read().decode("utf-8")\n    try:\n        source=await asyncio.wait_for(asyncio.to_thread(fetch_source),timeout=PUBLIC_GIT_CHECK_TIMEOUT+1)\n        match=re.search(r'AGENT_VERSION\\s*=\\s*["\\\\\']([^"\\\\\']+)["\\\\\']',source)\n        version=match.group(1).strip() if match else None\n        if not version:\n            return {"available":False,"version":None,"message":"Public Git version could not be read.","source":url}\n        return {"available":True,"version":version,"source":url,"update_available":version != AGENT_VERSION}\n    except (asyncio.TimeoutError,urllib.error.URLError,urllib.error.HTTPError,OSError,ValueError) as exc:\n        logger.warning("Public Git version check failed: %s",exc)\n        return {"available":False,"version":None,"message":"Public Git version could not be verified.","source":url}\n\n'''
-          if marker not in text:
-              raise SystemExit("Could not find release function marker")
-          text = text.replace(marker, insert + marker, 1)
+          if marker in text and 'async def get_public_git_version()' not in text:
+              text = text.replace(marker, insert + marker, 1)
 
           old = '''@app.get("/version")\nasync def version_endpoint():\n    mcp_version = None\n    try:\n        async with streamable_http_client(MCP_URL) as (read_stream,write_stream):\n            async with ClientSession(read_stream,write_stream) as session:\n                init = await run_with_timeout(session.initialize(),MCP_TIMEOUT,"MCP version discovery")\n                server_info = getattr(init, "server_info", None)\n                mcp_version = getattr(server_info, "version", None) if server_info else None\n    except Exception as exc:\n        logger.warning("MCP version discovery failed: %s", exc)\n    return {"agent_version": AGENT_VERSION, "mcp_version": mcp_version}\n'''
           new = '''@app.get("/version")\nasync def version_endpoint():\n    mcp_version = None\n    try:\n        async with streamable_http_client(MCP_URL) as (read_stream,write_stream):\n            async with ClientSession(read_stream,write_stream) as session:\n                init = await run_with_timeout(session.initialize(),MCP_TIMEOUT,"MCP version discovery")\n                server_info = getattr(init, "server_info", None)\n                mcp_version = getattr(server_info, "version", None) if server_info else None\n    except Exception as exc:\n        logger.warning("MCP version discovery failed: %s", exc)\n    public_git = await get_public_git_version()\n    return {\n        "agent_version": AGENT_VERSION,\n        "mcp_version": mcp_version,\n        "public_agent_version": public_git.get("version"),\n        "public_update_available": bool(public_git.get("update_available")),\n        "public_git_check_available": bool(public_git.get("available")),\n    }\n'''
-          if old not in text:
-              raise SystemExit("Could not find version endpoint")
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
 
           path.write_text(text)
-          print("Patched agent.py")
+          print("Patched agent.py if needed")
 
-      - name: Commit patch
+      - name: Commit patch if needed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add agent/agent.py
           git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No changes required"
+            exit 0
+          fi
           git commit -m "feat: show public git update availability"
           git push

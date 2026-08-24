@@ -42,13 +42,22 @@ Commit-specific tags are also published. The **Docker Build** badge is green whe
 
 ## Home Assistant compatibility and minimum requirements
 
-The Agent is designed to work with different Home Assistant deployment types and does **not** assume Home Assistant OS, Docker, Supervised or a specific host platform. The connected Home Assistant Core version is detected dynamically through the API, and platform-dependent capabilities are derived from the connected instance.
+The Agent connects directly to **Home Assistant Core** through the Home Assistant REST API and WebSocket API. It does **not** require the built-in Home Assistant MCP integration.
 
-### Home Assistant Core version
+The installation type (Home Assistant OS, Container, etc.) is therefore separate from the Core version. The following table documents the supported baseline for this project. This is a **documentation requirement only** and is intentionally **not hard-coded or enforced in the code**.
 
-The project intentionally does **not** hard-code a minimum Home Assistant Core version in the README until the minimum version has been established from all Home Assistant APIs and WebSocket commands used by the current MCP implementation.
+| Home Assistant installation | Home Assistant Core | Agent / MCP compatibility | Notes |
+|---|---:|---|---|
+| **Home Assistant OS** | **2025.6 or newer** | ✅ Compatible | Recommended Home Assistant installation |
+| **Home Assistant Container** | **2025.6 or newer** | ✅ Compatible | Recommended for Docker-based environments |
+| **Home Assistant Core** | **2025.6 or newer** | ⚠️ API-compatible, but installation method is no longer a recommended supported method | The MCP itself only depends on Core APIs |
+| **Home Assistant Supervised** | **2025.6 or newer** | ⚠️ API-compatible, but installation method is no longer a recommended supported method | The MCP itself only depends on Core APIs |
 
-The compatibility baseline must be determined from the oldest Home Assistant Core version that supports **all required interfaces**, including:
+### Important distinction: Home Assistant Core vs. installation type
+
+The version shown by Home Assistant as **Core** is the relevant version for MCP compatibility. **OS version, Supervisor version and Container image version are not used as the MCP compatibility version.**
+
+The MCP requires the Home Assistant interfaces used by the current implementation, including:
 
 - REST `/api/config` and authenticated API access
 - Home Assistant WebSocket authentication
@@ -58,9 +67,19 @@ The compatibility baseline must be determined from the oldest Home Assistant Cor
 - Energy Dashboard WebSocket commands used by the MCP (`energy/get_prefs`, `energy/info`, `energy/validate`, `energy/save_prefs`)
 - other APIs required by the currently exposed MCP tools
 
-The Long-Lived Access Token used by the Docker MCP is **not the limiting compatibility factor**. The MCP authenticates using a Home Assistant Long-Lived Access Token supplied through `HA_TOKEN`; token availability must be checked separately from the API/WebSocket feature baseline.
+The **2025.6** value above is a documented project baseline. It is **not enforced by the MCP**. The Agent/MCP continues to determine the connected Home Assistant Core version dynamically at runtime.
 
-Until the complete compatibility matrix has been verified, documentation and implementation must not claim an arbitrary minimum HA version. Once verified, the exact minimum version should be documented here and enforced by the MCP with a clear compatibility message.
+### HACS compatibility
+
+HACS is independent of the Agent/MCP compatibility baseline. For HACS itself, **Home Assistant 2024.4.1 or newer** is required according to the HACS prerequisites.
+
+This does not mean that the Home Assistant AI Agent/MCP is supported on every Home Assistant version that can run HACS.
+
+### Long-Lived Access Token
+
+The Docker MCP authenticates against Home Assistant using a **Long-Lived Access Token** supplied through `HA_TOKEN`. The token is created inside the Home Assistant user profile and is independent of the Home Assistant installation type.
+
+The Long-Lived Access Token itself is therefore **not the version compatibility mechanism**. Compatibility depends on the Home Assistant Core APIs used by the MCP.
 
 ### Dynamic compatibility detection
 
@@ -247,7 +266,7 @@ Basic validation should cover:
 9. Conversational follow-ups such as `Ja` after an offered search/action.
 10. Agent `/health` and `/models` endpoints.
 11. Platform-dependent advice must respect detected capabilities and must not assume Home Assistant OS.
-12. Compatibility testing against the oldest supported Home Assistant Core version before declaring or changing the documented minimum version.
+12. Compatibility testing against the oldest supported Home Assistant Core version before changing the documented compatibility baseline.
 
 ## Security
 

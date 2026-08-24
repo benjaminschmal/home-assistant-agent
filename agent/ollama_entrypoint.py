@@ -1,8 +1,12 @@
 import asyncio
+import json
 import os
 
-from fastapi import FastAPI
-from openai import AsyncOpenAI
+# The base agent historically requires an OpenAI key at import time.
+# Allow a fully local Ollama deployment without weakening the normal OpenAI path.
+OPENAI_CONFIGURED = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+if not OPENAI_CONFIGURED:
+    os.environ["OPENAI_API_KEY"] = "local-only"
 
 import agent as base
 
@@ -10,7 +14,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b").strip()
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
 
-ollama_client = AsyncOpenAI(
+ollama_client = base.AsyncOpenAI(
     base_url=f"{OLLAMA_URL}/v1",
     api_key="ollama",
     timeout=OLLAMA_TIMEOUT,
@@ -19,7 +23,11 @@ ollama_client = AsyncOpenAI(
 
 
 def _remove_routes(paths):
-    base.app.routes[:] = [route for route in base.app.routes if getattr(route, "path", None) not in paths]
+    base.app.routes[:] = [
+        route
+        for route in base.app.routes
+        if getattr(route, "path", None) not in paths
+    ]
 
 
 async def ollama_available():
@@ -61,8 +69,8 @@ async def run_ollama_agent(session, tools, user_message, history):
         messages.append(message.model_dump(exclude_none=True))
         for tool_call in message.tool_calls:
             try:
-                arguments = __import__("json").loads(tool_call.function.arguments or "{}")
-            except ValueError as exc:
+                arguments = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as exc:
                 raise RuntimeError(
                     f"Invalid arguments for MCP tool {tool_call.function.name}"
                 ) from exc
@@ -89,13 +97,14 @@ _remove_routes({"/models", "/chat", "/health"})
 @base.app.get("/models")
 async def models_endpoint():
     available = await ollama_available()
+    default_model = "openai" if OPENAI_CONFIGURED else "ollama"
     return {
-        "default_model": "openai",
+        "default_model": default_model,
         "models": [
             {
                 "id": "openai",
                 "name": f"GPT ({base.OPENAI_MODEL})",
-                "available": True,
+                "available": OPENAI_CONFIGURED,
             },
             {
                 "id": "anthropic",
@@ -117,10 +126,11 @@ async def health():
     return {
         "status": "ok",
         "service": "home-assistant-agent",
-        "provider": "openai",
-        "model": base.OPENAI_MODEL,
+        "provider": "ollama" if not OPENAI_CONFIGURED else "openai",
+        "model": OLLAMA_MODEL if not OPENAI_CONFIGURED else base.OPENAI_MODEL,
         "mcp_configured": bool(base.MCP_URL),
         "anthropic_configured": bool(base.ANTHROPIC_API_KEY),
+        "openai_configured": OPENAI_CONFIGURED,
         "ollama_available": available,
         "ollama_model": OLLAMA_MODEL,
     }
@@ -136,6 +146,8 @@ async def chat(request: base.ChatRequest):
     try:
         if request.model not in {"openai", "anthropic", "ollama"}:
             raise ValueError("Selected model provider is not available")
+        if request.model == "openai" and not OPENAI_CONFIGURED:
+            raise ValueError("OpenAI is not configured: OPENAI_API_KEY is missing")
         if request.model == "anthropic" and not base.ANTHROPIC_API_KEY:
             raise ValueError("Claude is not configured: ANTHROPIC_API_KEY is missing")
         if request.model == "ollama" and not await ollama_available():

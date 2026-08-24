@@ -40,6 +40,34 @@ ghcr.io/benjaminschmal/home-assistant-mcp:latest
 
 Commit-specific tags are also published. The **Docker Build** badge is green when the workflow succeeds.
 
+## Home Assistant compatibility and minimum requirements
+
+The Agent is designed to work with different Home Assistant deployment types and does **not** assume Home Assistant OS, Docker, Supervised or a specific host platform. The connected Home Assistant Core version is detected dynamically through the API, and platform-dependent capabilities are derived from the connected instance.
+
+### Home Assistant Core version
+
+The project intentionally does **not** hard-code a minimum Home Assistant Core version in the README until the minimum version has been established from all Home Assistant APIs and WebSocket commands used by the current MCP implementation.
+
+The compatibility baseline must be determined from the oldest Home Assistant Core version that supports **all required interfaces**, including:
+
+- REST `/api/config` and authenticated API access
+- Home Assistant WebSocket authentication
+- entity and service access
+- Lovelace dashboard discovery and configuration
+- dashboard creation/deletion
+- Energy Dashboard WebSocket commands used by the MCP (`energy/get_prefs`, `energy/info`, `energy/validate`, `energy/save_prefs`)
+- other APIs required by the currently exposed MCP tools
+
+The Long-Lived Access Token used by the Docker MCP is **not the limiting compatibility factor**. The MCP authenticates using a Home Assistant Long-Lived Access Token supplied through `HA_TOKEN`; token availability must be checked separately from the API/WebSocket feature baseline.
+
+Until the complete compatibility matrix has been verified, documentation and implementation must not claim an arbitrary minimum HA version. Once verified, the exact minimum version should be documented here and enforced by the MCP with a clear compatibility message.
+
+### Dynamic compatibility detection
+
+At runtime, the MCP reads the connected Home Assistant Core version from `/api/config`. The Agent uses the returned version and capability information for platform-dependent advice. This allows the same Agent/MCP build to remain flexible across different Home Assistant installations instead of assuming a fixed platform or version.
+
+If a required API or WebSocket command is not available on the connected Home Assistant version, the MCP should return a clear compatibility error rather than silently guessing or presenting an unsupported operation as available.
+
 ## Configuration
 
 Keep secrets outside Git. Required variables:
@@ -219,6 +247,7 @@ Basic validation should cover:
 9. Conversational follow-ups such as `Ja` after an offered search/action.
 10. Agent `/health` and `/models` endpoints.
 11. Platform-dependent advice must respect detected capabilities and must not assume Home Assistant OS.
+12. Compatibility testing against the oldest supported Home Assistant Core version before declaring or changing the documented minimum version.
 
 ## Security
 

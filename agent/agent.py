@@ -33,6 +33,7 @@ MCP_TIMEOUT = float(os.environ.get("MCP_TIMEOUT_SECONDS", "15"))
 OPENAI_TIMEOUT = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
 ANTHROPIC_TIMEOUT = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "60"))
 RELEASE_CHECK_TIMEOUT = float(os.environ.get("RELEASE_CHECK_TIMEOUT_SECONDS", "10"))
+PUBLIC_GIT_CHECK_TIMEOUT = float(os.environ.get("PUBLIC_GIT_CHECK_TIMEOUT_SECONDS", "8"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "8"))
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "12"))
 
@@ -68,12 +69,30 @@ const history=[];
 function addMessage(text,type){const div=document.createElement("div");div.className="message "+type;div.textContent=text;chat.appendChild(div);chat.scrollTop=chat.scrollHeight}
 async function loadModels(){try{const response=await fetch("/models"),data=await response.json();modelSelect.innerHTML="";for(const model of data.models||[]){const option=document.createElement("option");option.value=model.id;option.textContent=model.name+(model.available?"":" (nicht verfügbar)");option.disabled=!model.available;modelSelect.appendChild(option)}modelSelect.value=data.default_model||"openai"}catch(error){modelStatus.textContent="Modellliste nicht verfügbar"}}
 async function sendMessage(){const message=input.value.trim();if(!message)return;addMessage(message,"user");history.push({role:"user",content:message});input.value="";button.disabled=true;modelSelect.disabled=true;addMessage("Denke nach ...","assistant");try{const response=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message,model:modelSelect.value,history:history.slice(0,-1).slice(-12)})}),data=await response.json();chat.lastChild.remove();if(!response.ok||data.error){history.pop();addMessage("Fehler: "+(data.error||"Unbekannter Fehler"),"assistant")}else{addMessage(data.response,"assistant");history.push({role:"assistant",content:data.response});if(history.length>12)history.splice(0,history.length-12)}}catch(error){chat.lastChild.remove();history.pop();addMessage("Verbindungsfehler: "+error,"assistant")}finally{button.disabled=false;modelSelect.disabled=false;input.focus()}}
-async function loadVersion(){try{const response=await fetch("/version");const data=await response.json();document.getElementById("versionInfo").textContent=`Agent v${data.agent_version} · MCP v${data.mcp_version||"unbekannt"}`;}catch(error){document.getElementById("versionInfo").textContent="Agent v1.13.1 · MCP-Version nicht verfügbar"}}
+async function loadVersion(){try{const response=await fetch("/version"),data=await response.json();let text=`Agent v${data.agent_version} · MCP v${data.mcp_version||"unbekannt"}`;if(data.public_update_available){text+=` · ⚠ Neue Version verfügbar: Agent v${data.public_agent_version}`;}document.getElementById("versionInfo").textContent=text;}catch(error){document.getElementById("versionInfo").textContent="Agent v1.13.1 · MCP-Version nicht verfügbar"}}
 button.addEventListener("click",sendMessage);input.addEventListener("keydown",event=>{if(event.key==="Enter")sendMessage()});input.focus();loadModels();loadVersion();
 </script></body></html>
 """
 
 SYSTEM_PROMPT=("You are a Home Assistant AI assistant. Use the available Home Assistant tools to answer questions. IMPORTANT: Before giving platform-dependent advice or instructions about Add-ons, Supervisor, MQTT installation, backups, updates, configuration capabilities, or other installation-specific features, call get_home_assistant_info and use its returned capabilities. Never assume Home Assistant OS. If supervisor_available or addon_store_available is false, do not recommend or reference the Home Assistant Add-on Store or Supervisor; explain that the connected installation does not expose those capabilities and, where appropriate, describe the platform-neutral or external-service alternative. Use the actual connected Home Assistant environment, not generic Home Assistant assumptions. For questions about current Home Assistant devices, entities, sensors, states, temperatures, switches, printers, energy, or other live values, you MUST use the Home Assistant tools rather than relying on general knowledge. For unknown devices or sensors, search_entities first. Never invent entity IDs, values or states. Use get_entity_state when current state is required. Use call_service only for actions allowed by the MCP server. Configuration editing is a separate privileged capability. If the user asks to read or change YAML, first call configuration_status. If configuration editing is disabled, explain that it must be enabled. If enabled and the user explicitly asks to change an allowed YAML file, read the current file first, make the smallest necessary change, preserve all unrelated content, and then call update_config with the complete new file. Do not claim a configuration change was made unless update_config returns success. Never replace a configuration file with a guessed or unrelated example. For a requested configuration change, explain what will be changed before performing it when the change is consequential. For a harmless test such as adding a comment, it is acceptable to execute directly when explicitly requested. For Lovelace dashboards, always call list_dashboards before create_dashboard. If a dashboard with the requested URL path already exists, never call create_dashboard. Tell the user that the dashboard already exists and, if their request is to modify it, use read_dashboard followed by the smallest necessary update_dashboard change. Only call create_dashboard when the requested dashboard does not already exist. Do not claim a dashboard was created or changed unless the corresponding MCP tool returns success. IMPORTANT: maintain conversational context. A short reply such as 'ja', 'nein', 'mach das', 'weiter' or 'genau' refers to the immediately preceding assistant message and must be interpreted using the supplied conversation history. Do not restart the conversation or answer with a generic greeting. For questions about the built-in Home Assistant Energy dashboard, distinguish between the dashboard being visible and its energy sources being configured. Do not invent a manual procedure if the available MCP tools can inspect or change the actual configuration. If the user asks to search for available energy sources, actually search the current Home Assistant entities and report the matching entities and their relevant attributes. If the user asks to configure the Energy dashboard and an energy-specific tool is available, use it rather than editing unrelated YAML. If the requested capability is not exposed by the MCP, say so explicitly. If you offer to search for something and the user replies 'Ja', perform that search immediately. For questions asking whether the installed Home Assistant version is current, latest, newest, or whether an update is available, use get_home_assistant_info for the installed Core version and use the verified release context supplied by the Agent. Never infer that an installed version is current merely because it is recent. If the release check is unavailable, say that current release status could not be verified rather than guessing. When comparing versions, distinguish stable releases from beta/development releases. For questions about HACS, always call get_hacs_info first. Do not assume HACS is installed and do not use Supervisor or the Add-on Store as a proxy for HACS. Use the returned HACS version, latest stable version, installed repository count, categories and update information. If HACS or its repository storage cannot be detected, report that limitation instead of guessing.")
+
+async def get_public_git_version() -> dict[str, str | bool | None]:
+    """Check the public main branch for the latest agent version."""
+    url="https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/agent.py"
+    def fetch_source():
+        request=urllib.request.Request(url,headers={"User-Agent":"home-assistant-agent"})
+        with urllib.request.urlopen(request,timeout=PUBLIC_GIT_CHECK_TIMEOUT) as response:
+            return response.read().decode("utf-8")
+    try:
+        source=await asyncio.wait_for(asyncio.to_thread(fetch_source),timeout=PUBLIC_GIT_CHECK_TIMEOUT+1)
+        match=re.search(r'AGENT_VERSION\s*=\s*["\\']([^"\\']+)["\\']',source)
+        version=match.group(1).strip() if match else None
+        if not version:
+            return {"available":False,"version":None,"message":"Public Git version could not be read.","source":url}
+        return {"available":True,"version":version,"source":url,"update_available":version != AGENT_VERSION}
+    except (asyncio.TimeoutError,urllib.error.URLError,urllib.error.HTTPError,OSError,ValueError) as exc:
+        logger.warning("Public Git version check failed: %s",exc)
+        return {"available":False,"version":None,"message":"Public Git version could not be verified.","source":url}
 
 async def get_latest_home_assistant_release() -> dict[str, str | bool | None]:
     """Check the current stable Home Assistant Core release from the official GitHub repository."""
@@ -174,7 +193,14 @@ async def version_endpoint():
                 mcp_version = getattr(server_info, "version", None) if server_info else None
     except Exception as exc:
         logger.warning("MCP version discovery failed: %s", exc)
-    return {"agent_version": AGENT_VERSION, "mcp_version": mcp_version}
+    public_git = await get_public_git_version()
+    return {
+        "agent_version": AGENT_VERSION,
+        "mcp_version": mcp_version,
+        "public_agent_version": public_git.get("version"),
+        "public_update_available": bool(public_git.get("update_available")),
+        "public_git_check_available": bool(public_git.get("available")),
+    }
 
 @app.get("/health")
 async def health():

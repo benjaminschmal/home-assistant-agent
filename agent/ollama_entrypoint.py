@@ -13,6 +13,10 @@ import agent as base
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b").strip()
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
+OLLAMA_NUM_THREADS = int(os.environ.get("OLLAMA_NUM_THREADS", "8"))
+
+if OLLAMA_NUM_THREADS < 1:
+    raise RuntimeError("OLLAMA_NUM_THREADS must be at least 1")
 
 ollama_client = base.AsyncOpenAI(
     base_url=f"{OLLAMA_URL}/v1",
@@ -58,6 +62,7 @@ async def run_ollama_agent(session, tools, user_message, history):
                 messages=messages,
                 tools=base.openai_tools(tools),
                 tool_choice="auto",
+                extra_body={"options": {"num_thread": OLLAMA_NUM_THREADS}},
             ),
             OLLAMA_TIMEOUT,
             "Ollama request",
@@ -133,6 +138,7 @@ async def health():
         "openai_configured": OPENAI_CONFIGURED,
         "ollama_available": available,
         "ollama_model": OLLAMA_MODEL,
+        "ollama_num_threads": OLLAMA_NUM_THREADS,
     }
 
 

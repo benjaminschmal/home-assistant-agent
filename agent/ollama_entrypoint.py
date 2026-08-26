@@ -173,32 +173,30 @@ async def run_ollama_agent(session, tools, user_message, history, model):
 
 
 async def public_version_check():
-    url = "https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/ollama_entrypoint.py"
+    public = await base.get_public_git_version()
+    installed = str(base.AGENT_VERSION).strip()
+    public_version = str(public.get("version") or "").strip()
 
-    def fetch_source():
-        request = urllib.request.Request(url, headers={"User-Agent": "home-assistant-agent"})
-        with urllib.request.urlopen(request, timeout=base.PUBLIC_GIT_CHECK_TIMEOUT) as response:
-            return response.read().decode("utf-8")
+    def version_tuple(value):
+        parts = value.lstrip("v").split(".")
+        try:
+            return tuple(int(part) for part in parts[:3])
+        except (ValueError, TypeError):
+            return None
 
-    try:
-        source = await asyncio.wait_for(
-            asyncio.to_thread(fetch_source), timeout=base.PUBLIC_GIT_CHECK_TIMEOUT + 1
-        )
-        marker = 'base.AGENT_VERSION = "'
-        start = source.find(marker)
-        if start < 0:
-            return {"available": False, "version": None, "update_available": False}
-        start += len(marker)
-        end = source.find('"', start)
-        version = source[start:end] if end > start else None
-        return {
-            "available": bool(version),
-            "version": version,
-            "update_available": bool(version and version != base.AGENT_VERSION),
-        }
-    except Exception as exc:
-        base.logger.warning("Public Ollama version check failed: %s", exc)
-        return {"available": False, "version": None, "update_available": False}
+    installed_tuple = version_tuple(installed)
+    public_tuple = version_tuple(public_version)
+    update_available = bool(
+        installed_tuple is not None
+        and public_tuple is not None
+        and public_tuple > installed_tuple
+    )
+
+    return {
+        "available": bool(public.get("available")),
+        "version": public_version or None,
+        "update_available": update_available,
+    }
 
 
 _remove_routes({"/models", "/chat", "/health", "/version"})

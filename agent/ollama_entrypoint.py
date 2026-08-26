@@ -3,16 +3,13 @@ import json
 import os
 import urllib.request
 
-# The base agent historically requires an OpenAI key at import time.
-# Allow a fully local Ollama deployment without weakening the normal OpenAI path.
 OPENAI_CONFIGURED = bool(os.environ.get("OPENAI_API_KEY", "").strip())
 if not OPENAI_CONFIGURED:
     os.environ["OPENAI_API_KEY"] = "local-only"
 
 import agent as base
 
-# Ollama-specific release. Keep the base agent source unchanged for wrapper-only releases.
-base.AGENT_VERSION = "1.13.6"
+base.AGENT_VERSION = "1.13.7"
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b").strip()
@@ -52,7 +49,6 @@ async def ollama_models():
 
 
 async def ollama_capabilities(model):
-    """Return Ollama model capabilities, including whether tool calling is supported."""
     def fetch():
         payload = json.dumps({"model": model}).encode("utf-8")
         request = urllib.request.Request(
@@ -111,7 +107,6 @@ def ollama_model_name(model_id, tools_available=True):
 
 
 async def get_mcp_version():
-    """Read the MCP server version from the MCP initialize handshake."""
     try:
         async with base.streamable_http_client(base.MCP_URL) as (read_stream, write_stream):
             async with base.ClientSession(read_stream, write_stream) as session:
@@ -120,7 +115,7 @@ async def get_mcp_version():
                     base.MCP_TIMEOUT,
                     "MCP version initialization",
                 )
-                server_info = getattr(result, "serverInfo", None)
+                server_info = getattr(result, "server_info", None)
                 version = getattr(server_info, "version", None)
                 return str(version).strip() if version else None
     except Exception as exc:
@@ -178,7 +173,6 @@ async def run_ollama_agent(session, tools, user_message, history, model):
 
 
 async def public_version_check():
-    """Check the Ollama wrapper version, which is the deployed entrypoint version."""
     url = "https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/ollama_entrypoint.py"
 
     def fetch_source():

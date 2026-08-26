@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import urllib.request
 
 # The base agent historically requires an OpenAI key at import time.
 # Allow a fully local Ollama deployment without weakening the normal OpenAI path.
@@ -10,15 +11,14 @@ if not OPENAI_CONFIGURED:
 
 import agent as base
 
-# This entrypoint contains the latest Ollama-specific functionality. Keep the
-# displayed agent version in sync with this release without changing the base
-# agent source solely for the wrapper release number.
-base.AGENT_VERSION = "1.13.4"
+# Ollama-specific release. Keep the base agent source unchanged for wrapper-only releases.
+base.AGENT_VERSION = "1.13.5"
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b").strip()
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
 OLLAMA_NUM_THREADS = int(os.environ.get("OLLAMA_NUM_THREADS", "8"))
+OLLAMA_TOOL_CHECK_TIMEOUT = float(os.environ.get("OLLAMA_TOOL_CHECK_TIMEOUT_SECONDS", "5"))
 
 if OLLAMA_NUM_THREADS < 1:
     raise RuntimeError("OLLAMA_NUM_THREADS must be at least 1")
@@ -51,12 +51,49 @@ async def ollama_models():
         return []
 
 
-async def ollama_available(model=None):
+async def ollama_capabilities(model):
+    """Return Ollama model capabilities, including whether tool calling is supported."""
+    def fetch():
+        payload = json.dumps({"model": model}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{OLLAMA_URL}/api/show",
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "home-assistant-agent"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=OLLAMA_TOOL_CHECK_TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data.get("capabilities", [])
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fetch), timeout=OLLAMA_TOOL_CHECK_TIMEOUT + 1
+        )
+    except Exception as exc:
+        base.logger.warning("Ollama capability check failed for %s: %s", model, exc)
+        return []
+
+
+async def ollama_model_info(model):
+    capabilities = await ollama_capabilities(model)
+    return {
+        "id": model,
+        "capabilities": capabilities,
+        "tools": "tools" in capabilities,
+    }
+
+
+async def ollama_available(model=None, require_tools=False):
     model = model or OLLAMA_MODEL
-    return any(item.id == model for item in await ollama_models())
+    if not any(item.id == model for item in await ollama_models()):
+        return False
+    if require_tools:
+        info = await ollama_model_info(model)
+        return info["tools"]
+    return True
 
 
-def ollama_model_name(model_id):
+def ollama_model_name(model_id, tools_available=True):
     prefix = model_id.split(":", 1)[0].lower()
     labels = {
         "qwen": "Qwen",
@@ -69,7 +106,8 @@ def ollama_model_name(model_id):
         "deepseek": "DeepSeek",
     }
     label = next((value for key, value in labels.items() if prefix.startswith(key)), None)
-    return f"{label} ({model_id})" if label else f"Ollama ({model_id})"
+    name = f"{label} ({model_id})" if label else f"Ollama ({model_id})"
+    return name if tools_available else f"{name} – keine HA-Tools"
 
 
 async def run_ollama_agent(session, tools, user_message, history, model):
@@ -121,22 +159,59 @@ async def run_ollama_agent(session, tools, user_message, history, model):
     raise RuntimeError("Maximum tool-call rounds exceeded")
 
 
-_remove_routes({"/models", "/chat", "/health"})
+async def public_version_check():
+    """Check the Ollama wrapper version, which is the deployed entrypoint version."""
+    url = "https://raw.githubusercontent.com/benjaminschmal/home-assistant-agent/main/agent/ollama_entrypoint.py"
+
+    def fetch_source():
+        request = urllib.request.Request(url, headers={"User-Agent": "home-assistant-agent"})
+        with urllib.request.urlopen(request, timeout=base.PUBLIC_GIT_CHECK_TIMEOUT) as response:
+            return response.read().decode("utf-8")
+
+    try:
+        source = await asyncio.wait_for(
+            asyncio.to_thread(fetch_source), timeout=base.PUBLIC_GIT_CHECK_TIMEOUT + 1
+        )
+        marker = 'base.AGENT_VERSION = "'
+        start = source.find(marker)
+        if start < 0:
+            return {"available": False, "version": None, "update_available": False}
+        start += len(marker)
+        end = source.find('"', start)
+        version = source[start:end] if end > start else None
+        return {
+            "available": bool(version),
+            "version": version,
+            "update_available": bool(version and version != base.AGENT_VERSION),
+        }
+    except Exception as exc:
+        base.logger.warning("Public Ollama version check failed: %s", exc)
+        return {"available": False, "version": None, "update_available": False}
+
+
+_remove_routes({"/models", "/chat", "/health", "/version"})
 
 
 @base.app.get("/models")
 async def models_endpoint():
     models = await ollama_models()
-    ollama_entries = [
-        {
-            "id": item.id,
-            "name": ollama_model_name(item.id),
-            "available": True,
-        }
-        for item in models
-    ]
+    ollama_entries = []
+    for item in models:
+        info = await ollama_model_info(item.id)
+        ollama_entries.append(
+            {
+                "id": item.id,
+                "name": ollama_model_name(item.id, info["tools"]),
+                "available": info["tools"],
+                "tools": info["tools"],
+                "capabilities": info["capabilities"],
+            }
+        )
 
-    default_model = "openai" if OPENAI_CONFIGURED else OLLAMA_MODEL
+    tool_models = [item["id"] for item in ollama_entries if item["tools"]]
+    default_model = "openai" if OPENAI_CONFIGURED else (
+        OLLAMA_MODEL if OLLAMA_MODEL in tool_models else (tool_models[0] if tool_models else OLLAMA_MODEL)
+    )
     return {
         "default_model": default_model,
         "models": [
@@ -144,11 +219,13 @@ async def models_endpoint():
                 "id": "openai",
                 "name": f"GPT ({base.OPENAI_MODEL})",
                 "available": OPENAI_CONFIGURED,
+                "tools": OPENAI_CONFIGURED,
             },
             {
                 "id": "anthropic",
                 "name": f"Claude ({base.ANTHROPIC_MODEL})",
                 "available": bool(base.ANTHROPIC_API_KEY),
+                "tools": bool(base.ANTHROPIC_API_KEY),
             },
             *ollama_entries,
         ],
@@ -158,7 +235,8 @@ async def models_endpoint():
 @base.app.get("/health")
 async def health():
     models = await ollama_models()
-    model_ids = [item.id for item in models]
+    model_infos = [await ollama_model_info(item.id) for item in models]
+    model_ids = [item["id"] for item in model_infos]
     return {
         "status": "ok",
         "service": "home-assistant-agent",
@@ -170,7 +248,21 @@ async def health():
         "ollama_available": bool(model_ids),
         "ollama_model": OLLAMA_MODEL,
         "ollama_models": model_ids,
+        "ollama_tool_models": [item["id"] for item in model_infos if item["tools"]],
         "ollama_num_threads": OLLAMA_NUM_THREADS,
+    }
+
+
+@base.app.get("/version")
+async def version_endpoint():
+    public = await public_version_check()
+    mcp = await base.get_mcp_version()
+    return {
+        "agent_version": base.AGENT_VERSION,
+        "mcp_version": mcp,
+        "public_update_available": public.get("update_available", False),
+        "public_agent_version": public.get("version"),
+        "public_version_available": public.get("available", False),
     }
 
 
@@ -191,9 +283,9 @@ async def chat(request: base.ChatRequest):
                 raise ValueError("Claude is not configured: ANTHROPIC_API_KEY is missing")
             selected_provider = "anthropic"
         else:
-            if not await ollama_available(request.model):
+            if not await ollama_available(request.model, require_tools=True):
                 raise ValueError(
-                    f"Ollama model {request.model} is not reachable or not installed"
+                    f"Das Modell {request.model} unterstützt kein Tool-Calling und kann daher nicht mit Home Assistant verwendet werden. Bitte wähle ein Modell mit HA-Tools, z. B. Qwen 3:4b."
                 )
             selected_provider = "ollama"
 

@@ -10,6 +10,11 @@ if not OPENAI_CONFIGURED:
 
 import agent as base
 
+# This entrypoint contains the latest Ollama-specific functionality. Keep the
+# displayed agent version in sync with this release without changing the base
+# agent source solely for the wrapper release number.
+base.AGENT_VERSION = "1.13.4"
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b").strip()
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))

@@ -22,7 +22,7 @@ MAX_SEARCH_RESULTS = int(os.environ.get("MAX_SEARCH_RESULTS", "50"))
 CONFIG_ROOT = Path(os.environ.get("HA_CONFIG_PATH", "/config")).resolve()
 ALLOW_CONFIGURATION = os.environ.get("MCP_ALLOW_CONFIGURATION", "false").strip().lower() in {"1", "true", "yes", "on"}
 ALLOWED_CONFIG_FILES = {"configuration.yaml", "automations.yaml", "scripts.yaml", "scenes.yaml"}
-DEFAULT_ALLOWED_SERVICES = {"light.turn_on","light.turn_off","light.toggle","switch.turn_on","switch.turn_off","switch.toggle","climate.set_temperature","cover.open_cover","cover.close_cover","cover.stop_cover","fan.turn_on","fan.turn_off","fan.toggle","media_player.media_play","media_player.media_pause","media_player.media_stop","media_player.volume_set","scene.turn_on","script.turn_on","automation.turn_on","automation.off","automation.toggle"}
+DEFAULT_ALLOWED_SERVICES = {"light.turn_on","light.turn_off","light.toggle","switch.turn_on","switch.turn_off","switch.toggle","climate.set_temperature","cover.open_cover","cover.close_cover","cover.stop_cover","fan.turn_on","fan.turn_off","fan.toggle","media_player.media_play","media_player.media_pause","media_player.media_stop","media_player.volume_set","scene.turn_on","script.turn_on","automation.turn_on","automation.turn_off","automation.toggle","utility_meter.calibrate"}
 _raw_allowed_services = os.environ.get("MCP_ALLOWED_SERVICES", "")
 ALLOWED_SERVICES = ({x.strip().lower() for x in _raw_allowed_services.split(",") if x.strip()} if _raw_allowed_services.strip() else DEFAULT_ALLOWED_SERVICES)
 if not HA_URL:
@@ -84,8 +84,12 @@ async def get_home_assistant_info() -> dict[str, Any]:
 
 async def ha_call_service(domain: str, service: str, service_data: dict[str, Any]) -> Any:
     key = f"{domain}.{service}".lower()
-    if key not in ALLOWED_SERVICES: raise PermissionError(f"Service '{key}' is not allowed")
-    if not re.fullmatch(r"[a-z0-9_]+", domain) or not re.fullmatch(r"[a-z0-9_]+", service): raise ValueError("Invalid Home Assistant service")
+    if not re.fullmatch(r"[a-z0-9_]+", domain) or not re.fullmatch(r"[a-z0-9_]+", service):
+        raise ValueError("Invalid Home Assistant service")
+    if key not in ALLOWED_SERVICES:
+        raise PermissionError(f"Service '{key}' is not allowed")
+    if not isinstance(service_data, dict):
+        raise ValueError("service_data must be an object")
     return await ha_post(f"/api/services/{domain}/{service}", service_data)
 
 async def ha_ws_command(command_type: str, payload: dict[str, Any] | None = None) -> Any:
@@ -227,8 +231,6 @@ async def get_hacs_info() -> dict[str, Any]:
             local_path = repo.get("local_path")
             installed_flag = bool(repo.get("installed"))
 
-            # HACS storage versions differ. If the explicit installed flag is
-            # absent, verify the local installation on disk.
             if not installed_flag:
                 if category == "integration" and domain:
                     installed_flag = (CONFIG_ROOT / "custom_components" / str(domain)).is_dir()
@@ -320,7 +322,7 @@ def normalize(value: Any) -> str: return re.sub(r"[^a-z0-9]+"," ",str(value or "
 def text_result(value: Any) -> CallToolResult: return CallToolResult(content=[TextContent(type="text",text=json.dumps(value,ensure_ascii=False,indent=2) if not isinstance(value,str) else value)])
 
 async def list_tools(context, params) -> ListToolsResult:
-    return ListToolsResult(tools=[Tool(name="get_hacs_info",description="Inspect HACS installation, HACS version, installed HACS repositories and their current/update status directly from HACS without assuming Home Assistant OS or Supervisor.",inputSchema={"type":"object","properties":{}}),Tool(name="get_home_assistant_info",description="Detect connected Home Assistant version and capabilities.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_preferences",description="Read Energy Dashboard preferences.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_info",description="Read Energy Dashboard metadata.",inputSchema={"type":"object","properties":{}}),Tool(name="validate_energy_preferences",description="Validate Energy Dashboard configuration.",inputSchema={"type":"object","properties":{}}),Tool(name="search_entities",description="Search Home Assistant entities.",inputSchema={"type":"object","properties":{"query":{"type":"string"}}}),Tool(name="get_entity_state",description="Read an entity state.",inputSchema={"type":"object","properties":{"entity_id":{"type":"string"}},"required":["entity_id"]}),Tool(name="list_config_entries",description="List configured integrations.",inputSchema={"type":"object","properties":{"domain":{"type":"string"}}})])
+    return ListToolsResult(tools=[Tool(name="get_hacs_info",description="Inspect HACS installation, HACS version, installed HACS repositories and their current/update status directly from HACS without assuming Home Assistant OS or Supervisor.",inputSchema={"type":"object","properties":{}}),Tool(name="get_home_assistant_info",description="Detect connected Home Assistant version and capabilities.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_preferences",description="Read Energy Dashboard preferences.",inputSchema={"type":"object","properties":{}}),Tool(name="get_energy_info",description="Read Energy Dashboard metadata.",inputSchema={"type":"object","properties":{}}),Tool(name="validate_energy_preferences",description="Validate Energy Dashboard configuration.",inputSchema={"type":"object","properties":{}}),Tool(name="search_entities",description="Search Home Assistant entities.",inputSchema={"type":"object","properties":{"query":{"type":"string"}}}),Tool(name="get_entity_state",description="Read an entity state.",inputSchema={"type":"object","properties":{"entity_id":{"type":"string"}},"required":["entity_id"]}),Tool(name="list_config_entries",description="List configured integrations.",inputSchema={"type":"object","properties":{"domain":{"type":"string"}}}),Tool(name="call_service",description="Execute a Home Assistant service, but only when the service is on the MCP allowlist. Use the exact domain and service name, for example utility_meter.calibrate or light.turn_on. Pass entity_id and service-specific parameters in service_data.",inputSchema={"type":"object","properties":{"domain":{"type":"string","pattern":"^[a-z0-9_]+$","description":"Home Assistant service domain, e.g. utility_meter or light."},"service":{"type":"string","pattern":"^[a-z0-9_]+$","description":"Home Assistant service name, e.g. calibrate or turn_on."},"service_data":{"type":"object","description":"Service data including target entity_id and any service-specific parameters."}},"required":["domain","service","service_data"]})])
 
 async def call_tool(context, params) -> CallToolResult:
     args=params.arguments or {}
@@ -335,9 +337,14 @@ async def call_tool(context, params) -> CallToolResult:
         return text_result(entries)
     if params.name=="search_entities": return text_result(await ha_get("/api/states"))
     if params.name=="get_entity_state": return text_result(await ha_get(f"/api/states/{args.get('entity_id')}"))
+    if params.name=="call_service":
+        domain=str(args.get("domain") or "").strip().lower()
+        service=str(args.get("service") or "").strip().lower()
+        service_data=args.get("service_data") or {}
+        return text_result({"success": True, "service": f"{domain}.{service}", "result": await ha_call_service(domain, service, service_data)})
     raise ValueError(f"Unknown tool: {params.name}")
 
-server=Server("home-assistant-mcp",version="1.12.0",on_list_tools=list_tools,on_call_tool=call_tool)
+server=Server("home-assistant-mcp",version="1.13.0",on_list_tools=list_tools,on_call_tool=call_tool)
 
 async def main():
     app=server.streamable_http_app(streamable_http_path="/mcp",host="0.0.0.0",stateless_http=True)
